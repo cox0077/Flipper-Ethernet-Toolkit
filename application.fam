@@ -1,0 +1,11 @@
+App(
+    appid="flipper_eth_toolkit",
+    name="Ethernet Toolkit",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="flipper_eth_toolkit_app",
+    stack_size=2048,
+    requires=["gui"],
+    fap_category="GPIO",
+    fap_description="Read W5500 SPI status, Ethernet link and network registers",
+    fap_version="0.1",
+)
