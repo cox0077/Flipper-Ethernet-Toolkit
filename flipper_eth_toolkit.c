@@ -1,7 +1,8 @@
 /*
- * Flipper Ethernet Toolkit v0.2 (experimental)
+ * Flipper Ethernet Toolkit v0.3 (experimental)
  * W5500 5V plug-in module on external SPI; Momentum mntm-012.
  * DHCP/UDP socket 0, gateway ICMP echo/IPRAW socket 1.
+ * ARP/MACRAW socket 0 (while DHCP is idle), TCP scan socket 2.
  * SPDX-License-Identifier: MIT
  */
 #include <furi.h>
@@ -13,6 +14,7 @@
 #include <furi_hal_power.h>
 #include <gui/gui.h>
 #include <input/input.h>
+#include <storage/storage.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -20,11 +22,19 @@
 
 #define SPI_TIMEOUT 100U
 #define SPI_CHUNK 128U
-#define PAGES 4U
+#define PAGES 7U
+#define ARP_LIMIT 48U
+#define ARP_SPACING_MS 130U
+#define TCP_TIMEOUT_MS 1200U
+#define TCP_PORT_COUNT 10U
+#define REPORT_DIR "/ext/apps_data/flipper_eth_toolkit"
+#define REPORT_FILE REPORT_DIR "/report.txt"
 #define DHCP_TIMEOUT_MS 4500U
 #define PING_TIMEOUT_MS 1800U
 #define S_DHCP 0U
 #define S_PING 1U
+#define S_TCP 2U
+#define S_ARP 0U
 
 /* W5500 common registers */
 #define REG_GAR 0x0001U
@@ -33,6 +43,8 @@
 #define REG_SIPR 0x000FU
 #define REG_PHY 0x002EU
 #define REG_VERSION 0x0039U
+#define REG_RTR 0x0019U
+#define REG_RCR 0x001BU
 /* W5500 socket register offsets */
 #define SN_MR 0x0000U
 #define SN_CR 0x0001U
@@ -46,12 +58,19 @@
 #define SN_TX_WR 0x0024U
 #define SN_RX_RSR 0x0026U
 #define SN_RX_RD 0x0028U
+#define SN_RXBUF_SIZE 0x001EU
 #define CR_OPEN 0x01U
+#define CR_CONNECT 0x04U
 #define CR_CLOSE 0x10U
 #define CR_SEND 0x20U
 #define CR_RECV 0x40U
+#define MODE_TCP 0x01U
 #define MODE_UDP 0x02U
+#define MODE_MACRAW 0x04U
 #define MODE_IPRAW 0x03U
+#define SOCK_INIT 0x13U
+#define SOCK_ESTABLISHED 0x17U
+#define SOCK_MACRAW 0x42U
 #define SOCK_UDP 0x22U
 #define SOCK_IPRAW 0x32U
 
@@ -177,6 +196,16 @@ static int sock_receive(uint8_t s, bool udp, uint8_t* dst, size_t cap,
     return 1;
 }
 
+/* The scan is local and deliberately bounded to the device's current /24. */
+typedef struct {
+    uint8_t ip[4];
+    uint8_t mac[6];
+} ArpHost;
+
+typedef enum {SCAN_IDLE, SCAN_ACTIVE, SCAN_DRAIN, SCAN_DONE, SCAN_ERROR} ScanStage;
+typedef enum {PORT_NOT_TESTED, PORT_OPEN, PORT_CLOSED, PORT_TIMEOUT, PORT_ERROR} PortResult;
+static const uint16_t tcp_ports[TCP_PORT_COUNT] = {21,22,23,53,80,139,443,445,3389,8080};
+
 typedef enum {D_IDLE, D_OFFER, D_ACK, D_LEASE, D_FAIL} DHCPStage;
 typedef enum {P_IDLE, P_WAIT, P_OK, P_TIMEOUT, P_FAIL} PingStage;
 typedef struct {
@@ -190,6 +219,23 @@ typedef struct {
     uint16_t ping_id;
     uint32_t ping_started, ping_deadline, ping_rtt_ms;
     uint8_t page;
+    /* ARP scan: socket 0 is temporarily MACRAW, one host per tick. */
+    ScanStage arp_stage;
+    uint16_t arp_probe; /* next host in 1..254 */
+    uint16_t arp_sent;
+    uint32_t arp_next_at, arp_drain_until;
+    uint8_t arp_count, arp_view;
+    ArpHost hosts[ARP_LIMIT];
+    /* TCP connect probe, one of ten fixed common ports per operation. */
+    ScanStage tcp_stage;
+    uint8_t tcp_index, tcp_view, tcp_target_index;
+    uint8_t tcp_target_ip[4];
+    uint32_t tcp_deadline;
+    uint16_t prior_rtr;
+    uint8_t prior_rcr;
+    bool timeout_cfg_saved;
+    PortResult tcp_results[TCP_PORT_COUNT];
+    bool sd_ok, sd_attempted;
 } AppState;
 
 typedef struct {
@@ -375,6 +421,268 @@ static void ping_tick(AppState* s) {
     if(expired(s->ping_deadline)) { s->ping=P_TIMEOUT; sock_close(S_PING); }
 }
 
+/* Ethernet RAW frames: W5500 prepends a two-byte length, including itself.
+ * Only first 42 bytes needed for ARP replies; consume entire RX packet.
+ * Returns 1 frame, 0 no frame/bad frame, -1 read error.
+ */
+static int macraw_receive(uint8_t* frame, uint16_t cap, uint16_t* out_len) {
+    uint16_t available=0, ptr=0;
+    if(!sn16(S_ARP,SN_RX_RSR,&available)) return -1;
+    if(available<2) return 0;
+    if(!sn16(S_ARP,SN_RX_RD,&ptr)) return -1;
+    uint8_t prefix[2];
+    if(!reg_read(rxblock(S_ARP),ptr,prefix,2)) return -1;
+    uint16_t len=(uint16_t)((prefix[0]<<8)|prefix[1]);
+    if(len<2 || len>2048) {
+        /* Unexpected framing: close scanner rather than corrupt RX pointer. */
+        return -1;
+    }
+    if(available<len) return 0;
+    uint16_t frame_len=(uint16_t)(len-2);
+    if(frame_len>0) {
+        uint16_t copy=frame_len<cap?frame_len:cap;
+        if(!reg_read(rxblock(S_ARP),(uint16_t)(ptr+2),frame,copy)) return -1;
+    }
+    if(!sw16(S_ARP,SN_RX_RD,(uint16_t)(ptr+len)) || !command(S_ARP,CR_RECV)) return -1;
+    *out_len=frame_len<cap?frame_len:cap;
+    return 1;
+}
+static bool macraw_send(const uint8_t* frame, uint16_t len) {
+    uint16_t free_bytes=0, wr_ptr=0;
+    if(!sn16(S_ARP,SN_TX_FSR,&free_bytes) || free_bytes<len) return false;
+    if(!sn16(S_ARP,SN_TX_WR,&wr_ptr)) return false;
+    if(!reg_write(txblock(S_ARP),wr_ptr,frame,len)) return false;
+    if(!sw16(S_ARP,SN_TX_WR,(uint16_t)(wr_ptr+len))) return false;
+    return command(S_ARP,CR_SEND);
+}
+static bool arp_request(const AppState* s, uint8_t last_octet) {
+    uint8_t eth[60]={0};
+    memset(eth,0xFF,6);          /* destination MAC: broadcast */
+    memcpy(eth+6,s->mac,6);      /* Ethernet source MAC */
+    eth[12]=0x08; eth[13]=0x06;  /* ARP */
+    eth[14]=0; eth[15]=1;       /* hardware: Ethernet */
+    eth[16]=0x08; eth[17]=0;    /* protocol: IPv4 */
+    eth[18]=6; eth[19]=4;       /* MAC and IP lengths */
+    eth[20]=0; eth[21]=1;       /* operation: request */
+    memcpy(eth+22,s->mac,6);
+    memcpy(eth+28,s->ip,4);
+    /* eth[32..37] target MAC = 0 */
+    memcpy(eth+38,s->ip,3);
+    eth[41]=last_octet;
+    return macraw_send(eth,sizeof(eth));
+}
+static void arp_keep_reply(AppState* s, const uint8_t* f, uint16_t n) {
+    if(n<42 || f[12]!=0x08 || f[13]!=0x06 ||
+       f[14]!=0 || f[15]!=1 || f[16]!=8 || f[17]!=0 ||
+       f[18]!=6 || f[19]!=4 || f[20]!=0 || f[21]!=2) return;
+    /* Reply for our exact IPv4, on the current /24, from actual sender. */
+    if(memcmp(f+38,s->ip,4)!=0 || memcmp(f+28,s->ip,3)!=0 ||
+       (f[31]==0 || f[31]==255) || !memcmp(f+28,s->ip,4) ||
+       memcmp(f+32,s->mac,6)!=0 || memcmp(f+6,f+22,6)!=0) return;
+    if(memcmp(f,s->mac,6)!=0 && memcmp(f,"\xFF\xFF\xFF\xFF\xFF\xFF",6)!=0) return;
+    for(uint8_t i=0;i<s->arp_count;i++) {
+        if(memcmp(s->hosts[i].ip,f+28,4)==0) {
+            memcpy(s->hosts[i].mac,f+22,6);
+            return;
+        }
+    }
+    if(s->arp_count>=ARP_LIMIT) return;
+    ArpHost* host=&s->hosts[s->arp_count++];
+    memcpy(host->ip,f+28,4);
+    memcpy(host->mac,f+22,6);
+}
+static void arp_stop(AppState* s, bool err) {
+    sock_close(S_ARP);
+    s->arp_stage=err?SCAN_ERROR:SCAN_DONE;
+}
+static void arp_start(AppState* s) {
+    if(s->arp_stage==SCAN_ACTIVE || s->arp_stage==SCAN_DRAIN) return;
+    s->arp_count=0; s->arp_view=0; s->arp_sent=0; s->arp_probe=1;
+    s->tcp_target_index=0;
+    s->tcp_stage=SCAN_IDLE;
+    s->tcp_index=0;
+    memset(s->tcp_results,0,sizeof(s->tcp_results));
+    if(s->dhcp!=D_LEASE || !s->found || !(s->phy&1) ||
+       zero_ip(s->ip) || zero_ip(s->mask)) {
+        s->arp_stage=SCAN_ERROR; return;
+    }
+    sock_close(S_DHCP);
+    sock_close(S_PING);
+    s->ping=P_IDLE;
+    sock_close(S_TCP);
+    if(!sw8(S_ARP,SN_MR,MODE_MACRAW) || !command(S_ARP,CR_OPEN)) {
+        arp_stop(s,true);return;
+    }
+    uint8_t status=0;
+    if(!sn8(S_ARP,SN_SR,&status) || status!=SOCK_MACRAW) {arp_stop(s,true);return;}
+    s->arp_stage=SCAN_ACTIVE;
+    s->arp_next_at=furi_get_tick();
+}
+static void arp_tick(AppState* s) {
+    if(s->arp_stage!=SCAN_ACTIVE && s->arp_stage!=SCAN_DRAIN) return;
+    for(uint8_t i=0;i<6;i++) {
+        uint8_t frame[64];uint16_t size=0;
+        int got=macraw_receive(frame,sizeof(frame),&size);
+        if(got<0) {arp_stop(s,true);return;}
+        if(!got) break;
+        arp_keep_reply(s,frame,size);
+    }
+    if(s->arp_stage==SCAN_DRAIN) {
+        if(expired(s->arp_drain_until)) arp_stop(s,false);
+        return;
+    }
+    if(!expired(s->arp_next_at)) return;
+    /* One packet every 130 ms; single /24 and max 254 probes. */
+    while(s->arp_probe<=254) {
+        uint8_t host=(uint8_t)s->arp_probe;
+        uint8_t host_bits=(uint8_t)~s->mask[3];
+        bool same_subnet=(uint8_t)(host&s->mask[3])==(uint8_t)(s->ip[3]&s->mask[3]);
+        bool net_or_bcast=((host&host_bits)==0 || (host&host_bits)==host_bits);
+        if(host!=s->ip[3] && same_subnet && !net_or_bcast) break;
+        s->arp_probe++;
+    }
+    if(s->arp_probe>254) {
+        s->arp_stage=SCAN_DRAIN;
+        s->arp_drain_until=after_ms(800);
+        return;
+    }
+    if(!arp_request(s,(uint8_t)s->arp_probe)) {arp_stop(s,true);return;}
+    s->arp_probe++; s->arp_sent++;
+    s->arp_next_at=after_ms(ARP_SPACING_MS);
+}
+static const char* port_text(PortResult r) {
+    switch(r) {
+    case PORT_OPEN: return "OPEN";
+    case PORT_CLOSED: return "CLOSED";
+    case PORT_TIMEOUT: return "TIMEOUT";
+    case PORT_ERROR: return "ERROR";
+    default: return "-";
+    }
+}
+static void tcp_restore_timeout(AppState* s) {
+    if(s->timeout_cfg_saved) {
+        (void)wr16(0,REG_RTR,s->prior_rtr);
+        (void)wr8(0,REG_RCR,s->prior_rcr);
+        s->timeout_cfg_saved=false;
+    }
+}
+static void tcp_stop(AppState* s, bool err) {
+    sock_close(S_TCP);
+    tcp_restore_timeout(s);
+    s->tcp_stage=err?SCAN_ERROR:SCAN_DONE;
+}
+static bool tcp_begin_port(AppState* s) {
+    const uint8_t sock=S_TCP;
+    sock_close(sock);
+    if(!sw8(sock,SN_MR,MODE_TCP) ||
+       !sw16(sock,SN_PORT,(uint16_t)(40000U+s->tcp_index)) ||
+       !reg_write(sblock(sock),SN_DIPR,s->tcp_target_ip,4) ||
+       !sw16(sock,SN_DPORT,tcp_ports[s->tcp_index]) ||
+       !command(sock,CR_OPEN)) return false;
+    uint8_t status=0;
+    if(!sn8(sock,SN_SR,&status) || status!=SOCK_INIT) return false;
+    if(!command(sock,CR_CONNECT)) return false;
+    s->tcp_deadline=after_ms(TCP_TIMEOUT_MS);
+    return true;
+}
+static void tcp_start(AppState* s) {
+    if(s->tcp_stage==SCAN_ACTIVE || s->arp_stage==SCAN_ACTIVE ||
+       s->arp_stage==SCAN_DRAIN) return;
+    memset(s->tcp_results,0,sizeof(s->tcp_results));
+    s->tcp_index=0; s->tcp_view=0;
+    if(s->dhcp!=D_LEASE || !s->found || !(s->phy&1)) {
+        s->tcp_stage=SCAN_ERROR;return;
+    }
+    if(s->tcp_target_index==0) memcpy(s->tcp_target_ip,s->gateway,4);
+    else if((unsigned)s->tcp_target_index<=s->arp_count)
+        memcpy(s->tcp_target_ip,s->hosts[s->tcp_target_index-1].ip,4);
+    else {s->tcp_stage=SCAN_ERROR;return;}
+    if(zero_ip(s->tcp_target_ip)) {s->tcp_stage=SCAN_ERROR;return;}
+    if(!rd16(0,REG_RTR,&s->prior_rtr) || !rd8(0,REG_RCR,&s->prior_rcr)) {
+        s->tcp_stage=SCAN_ERROR;return;
+    }
+    s->timeout_cfg_saved=true;
+    /* Short retries for a bounded, low-rate diagnostic port check. */
+    if(!wr16(0,REG_RTR,1000) || !wr8(0,REG_RCR,2)) {
+        tcp_stop(s,true);return;
+    }
+    s->tcp_stage=SCAN_ACTIVE;
+    if(!tcp_begin_port(s)) {s->tcp_results[0]=PORT_ERROR;tcp_stop(s,true);}
+}
+static void tcp_tick(AppState* s) {
+    if(s->tcp_stage!=SCAN_ACTIVE) return;
+    uint8_t status=0,ir=0;
+    if(!sn8(S_TCP,SN_SR,&status) || !sn8(S_TCP,SN_IR,&ir)) {
+        s->tcp_results[s->tcp_index]=PORT_ERROR;
+        tcp_stop(s,true);return;
+    }
+    PortResult outcome=PORT_NOT_TESTED;
+    if(status==SOCK_ESTABLISHED || (ir&0x01U)) outcome=PORT_OPEN;
+    else if(ir&0x08U) outcome=PORT_TIMEOUT;
+    else if(status==0) outcome=PORT_CLOSED;
+    else if(expired(s->tcp_deadline)) outcome=PORT_TIMEOUT;
+    if(outcome==PORT_NOT_TESTED) return;
+    s->tcp_results[s->tcp_index]=outcome;
+    sock_close(S_TCP);
+    s->tcp_index++;
+    if(s->tcp_index>=TCP_PORT_COUNT) {tcp_stop(s,false);return;}
+    if(!tcp_begin_port(s)) {s->tcp_results[s->tcp_index]=PORT_ERROR;tcp_stop(s,true);}
+}
+static bool file_text(File* f, const char* b) {
+    size_t len=strlen(b);
+    return storage_file_write(f,b,len)==len;
+}
+static bool save_report(AppState* s) {
+    Storage* storage=furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+    bool ok=storage_simply_mkdir(storage,"/ext/apps_data") &&
+            storage_simply_mkdir(storage,REPORT_DIR);
+    File* f=storage_file_alloc(storage);
+    if(!f) {furi_record_close(RECORD_STORAGE);return false;}
+    if(ok) ok=storage_file_open(f,REPORT_FILE,FSAM_WRITE,FSOM_OPEN_APPEND);
+    char row[144];
+    if(ok) {
+        ok=file_text(f,"\n=== Flipper Ethernet Toolkit v0.3 ===\n");
+        snprintf(row,sizeof(row),"MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                 s->mac[0],s->mac[1],s->mac[2],s->mac[3],s->mac[4],s->mac[5]);
+        ok=ok&&file_text(f,row);
+        snprintf(row,sizeof(row),"IP: %u.%u.%u.%u / mask %u.%u.%u.%u\n",
+                 s->ip[0],s->ip[1],s->ip[2],s->ip[3],
+                 s->mask[0],s->mask[1],s->mask[2],s->mask[3]);
+        ok=ok&&file_text(f,row);
+        snprintf(row,sizeof(row),"Gateway: %u.%u.%u.%u, DNS: %u.%u.%u.%u\n",
+                 s->gateway[0],s->gateway[1],s->gateway[2],s->gateway[3],
+                 s->dns[0],s->dns[1],s->dns[2],s->dns[3]);
+        ok=ok&&file_text(f,row);
+        snprintf(row,sizeof(row),"ARP: %u probes; %u replies stored (max %u)\n",
+                 s->arp_sent,s->arp_count,ARP_LIMIT);
+        ok=ok&&file_text(f,row);
+        for(uint8_t i=0;i<s->arp_count && ok;i++) {
+            const ArpHost* h=&s->hosts[i];
+            snprintf(row,sizeof(row),"ARP %u.%u.%u.%u %02X:%02X:%02X:%02X:%02X:%02X\n",
+                     h->ip[0],h->ip[1],h->ip[2],h->ip[3],h->mac[0],h->mac[1],
+                     h->mac[2],h->mac[3],h->mac[4],h->mac[5]);
+            ok=file_text(f,row);
+        }
+        snprintf(row,sizeof(row),"TCP target: %u.%u.%u.%u\n",
+                 s->tcp_target_ip[0],s->tcp_target_ip[1],
+                 s->tcp_target_ip[2],s->tcp_target_ip[3]);
+        ok=ok&&file_text(f,row);
+        for(uint8_t i=0;i<TCP_PORT_COUNT && ok;i++) {
+            snprintf(row,sizeof(row),"TCP %u %s\n",tcp_ports[i],port_text(s->tcp_results[i]));
+            ok=file_text(f,row);
+        }
+        ok=ok&&file_text(f,"=== END ===\n");
+        if(ok) ok=storage_file_sync(f);
+    }
+    (void)storage_file_close(f);
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    s->sd_attempted=true;
+    s->sd_ok=ok;
+    return ok;
+}
+
 static void ip_string(char* b,size_t cap,const uint8_t ip[4]) {
     snprintf(b,cap,"%u.%u.%u.%u",ip[0],ip[1],ip[2],ip[3]);
 }
@@ -387,7 +695,7 @@ static void app_draw(Canvas* canvas, void* ctx) {
     char line[64], ip[20];
     canvas_clear(canvas);
     canvas_set_font(canvas,FontPrimary);
-    canvas_draw_str(canvas,2,11,"Eth Toolkit v0.2");
+    canvas_draw_str(canvas,2,11,"Eth Toolkit v0.3");
     canvas_draw_line(canvas,0,14,127,14);
     canvas_set_font(canvas,FontSecondary);
     if(s.page==0) {
@@ -420,7 +728,7 @@ static void app_draw(Canvas* canvas, void* ctx) {
         snprintf(line,sizeof(line),"DHCP: %s",status);canvas_draw_str(canvas,2,26,line);
         ip_string(ip,sizeof(ip),s.dns);snprintf(line,sizeof(line),"DNS: %s",ip);canvas_draw_str(canvas,2,38,line);
         canvas_draw_str(canvas,2,51,"OK = renew DHCP");
-    } else {
+    } else if(s.page==3) {
         canvas_draw_str(canvas,2,23,"Target: gateway IP");
         ip_string(ip,sizeof(ip),s.gateway);canvas_draw_str(canvas,2,34,ip);
         const char* status="OK = ping gateway";
@@ -429,8 +737,50 @@ static void app_draw(Canvas* canvas, void* ctx) {
         if(s.ping==P_TIMEOUT) status="PING: timeout";
         if(s.ping==P_FAIL) status="No DHCP / send error";
         canvas_draw_str(canvas,2,49,status);
+    } else if(s.page==4) {
+        const char* st="OK = ARP scan /24";
+        if(s.arp_stage==SCAN_ACTIVE) st="Scanning local /24...";
+        if(s.arp_stage==SCAN_DRAIN) st="Waiting for replies";
+        if(s.arp_stage==SCAN_DONE) st="Scan complete";
+        if(s.arp_stage==SCAN_ERROR) st="ARP failed / no DHCP";
+        canvas_draw_str(canvas,2,23,st);
+        snprintf(line,sizeof(line),"Probe %u/254 found %u",s.arp_sent,s.arp_count);
+        canvas_draw_str(canvas,2,33,line);
+        for(uint8_t i=0;i<2;i++) {
+            uint8_t index=(uint8_t)(s.arp_view+i);
+            if(index<s.arp_count) {
+                const ArpHost* h=&s.hosts[index];
+                snprintf(line,sizeof(line),"%u) %u.%u.%u.%u",(unsigned)(index+1),
+                         h->ip[0],h->ip[1],h->ip[2],h->ip[3]);
+                canvas_draw_str(canvas,2,(uint8_t)(43+i*10),line);
+            }
+        }
+    } else if(s.page==5) {
+        const char* st="OK = scan TCP";
+        if(s.tcp_stage==SCAN_ACTIVE) st="TCP: scanning...";
+        if(s.tcp_stage==SCAN_DONE) st="TCP: complete";
+        if(s.tcp_stage==SCAN_ERROR) st="TCP: error / DHCP";
+        canvas_draw_str(canvas,2,23,st);
+        const uint8_t* target=s.tcp_target_index==0?s.gateway:
+              (s.tcp_target_index<=s.arp_count?s.hosts[s.tcp_target_index-1].ip:s.gateway);
+        if(s.tcp_stage!=SCAN_IDLE) target=s.tcp_target_ip;
+        ip_string(ip,sizeof(ip),target);
+        snprintf(line,sizeof(line),"Target: %s",ip);
+        canvas_draw_str(canvas,2,33,line);
+        uint8_t open=0;
+        for(uint8_t i=0;i<TCP_PORT_COUNT;i++) if(s.tcp_results[i]==PORT_OPEN) open++;
+        snprintf(line,sizeof(line),"%u/%u  OPEN: %u",s.tcp_index,TCP_PORT_COUNT,open);
+        canvas_draw_str(canvas,2,43,line);
+        snprintf(line,sizeof(line),"%u: %s",tcp_ports[s.tcp_view],port_text(s.tcp_results[s.tcp_view]));
+        canvas_draw_str(canvas,2,53,line);
+    } else {
+        canvas_draw_str(canvas,2,24,"microSD report.txt");
+        canvas_draw_str(canvas,2,36,"OK = append report");
+        const char* st="Ready";
+        if(s.sd_attempted) st=s.sd_ok?"Saved successfully":"Save failed (SD?)";
+        canvas_draw_str(canvas,2,50,st);
     }
-    snprintf(line,sizeof(line),"</> page %u/%u  OK action",(unsigned)(s.page+1),PAGES);
+    snprintf(line,sizeof(line),"< > page %u/%u  OK",(unsigned)(s.page+1),PAGES);
     canvas_draw_str(canvas,2,63,line);
 }
 static void on_input(InputEvent* input,void* ctx) {
@@ -469,14 +819,43 @@ int32_t flipper_eth_toolkit_app(void* p) {
         InputEvent event;
         FuriStatus got=furi_message_queue_get(queue,&event,furi_ms_to_ticks(70));
         furi_mutex_acquire(app.mutex,FuriWaitForever);
+        if(got==FuriStatusOk && event.type==InputTypeLong &&
+           event.key==InputKeyOk && app.s.page==5 &&
+           app.s.tcp_stage!=SCAN_ACTIVE) {
+            /* Next target: gateway then each discovered ARP host. */
+            app.s.tcp_target_index=(uint8_t)((app.s.tcp_target_index+1)%(app.s.arp_count+1));
+            app.s.tcp_stage=SCAN_IDLE;
+            app.s.tcp_index=0;
+            memset(app.s.tcp_results,0,sizeof(app.s.tcp_results));
+        }
         if(got==FuriStatusOk && event.type==InputTypeShort) {
             if(event.key==InputKeyBack) running=false;
-            else if(event.key==InputKeyRight || event.key==InputKeyDown) app.s.page=(app.s.page+1)%PAGES;
-            else if(event.key==InputKeyLeft || event.key==InputKeyUp) app.s.page=(app.s.page+PAGES-1)%PAGES;
+            else if(event.key==InputKeyRight) app.s.page=(app.s.page+1)%PAGES;
+            else if(event.key==InputKeyLeft) app.s.page=(app.s.page+PAGES-1)%PAGES;
+            else if(event.key==InputKeyDown || event.key==InputKeyUp) {
+                int delta=(event.key==InputKeyDown)?1:-1;
+                if(app.s.page==4) {
+                    int v=(int)app.s.arp_view+delta;
+                    if(v>=0 && v<(int)app.s.arp_count) app.s.arp_view=(uint8_t)v;
+                } else if(app.s.page==5) {
+                    int v=(int)app.s.tcp_view+delta;
+                    if(v>=0 && v<(int)TCP_PORT_COUNT) app.s.tcp_view=(uint8_t)v;
+                } else app.s.page=(app.s.page+PAGES+(delta>0?1:PAGES-1))%PAGES;
+            }
             else if(event.key==InputKeyOk) {
-                if(app.s.page==2) dhcp_start(&app.s);
-                else if(app.s.page==3) ping_start(&app.s);
-                else update_physical(&app.s);
+                if(app.s.page==2 && app.s.arp_stage!=SCAN_ACTIVE &&
+                   app.s.arp_stage!=SCAN_DRAIN && app.s.tcp_stage!=SCAN_ACTIVE)
+                    dhcp_start(&app.s);
+                else if(app.s.page==3 && app.s.arp_stage!=SCAN_ACTIVE &&
+                        app.s.arp_stage!=SCAN_DRAIN && app.s.tcp_stage!=SCAN_ACTIVE)
+                    ping_start(&app.s);
+                else if(app.s.page==4 && app.s.tcp_stage!=SCAN_ACTIVE)
+                    arp_start(&app.s);
+                else if(app.s.page==5) tcp_start(&app.s);
+                else if(app.s.page==6 && app.s.arp_stage!=SCAN_ACTIVE &&
+                        app.s.arp_stage!=SCAN_DRAIN && app.s.tcp_stage!=SCAN_ACTIVE)
+                    (void)save_report(&app.s);
+                else if(app.s.page<2) update_physical(&app.s);
             }
         }
         if(running) {
@@ -484,10 +863,15 @@ int32_t flipper_eth_toolkit_app(void* p) {
             if(!app.s.found || !(app.s.phy&1)) {
                 if(app.s.dhcp==D_OFFER || app.s.dhcp==D_ACK) dhcp_fail(&app.s);
                 if(app.s.ping==P_WAIT) { sock_close(S_PING); app.s.ping=P_FAIL; }
+                if(app.s.arp_stage==SCAN_ACTIVE || app.s.arp_stage==SCAN_DRAIN)
+                    arp_stop(&app.s,true);
+                if(app.s.tcp_stage==SCAN_ACTIVE) tcp_stop(&app.s,true);
             } else {
                 if(app.s.dhcp==D_IDLE) dhcp_start(&app.s);
                 dhcp_tick(&app.s);
                 ping_tick(&app.s);
+                arp_tick(&app.s);
+                tcp_tick(&app.s);
             }
         }
         furi_mutex_release(app.mutex);
@@ -496,7 +880,8 @@ int32_t flipper_eth_toolkit_app(void* p) {
     gui_remove_view_port(gui,vp);
     view_port_free(vp);
     furi_record_close(RECORD_GUI);
-    sock_close(S_DHCP); sock_close(S_PING);
+    sock_close(S_DHCP); sock_close(S_PING); sock_close(S_TCP);
+    tcp_restore_timeout(&app.s);
     furi_hal_spi_bus_handle_deinit(&furi_hal_spi_bus_handle_external);
     if(!previous_5v && enabled) furi_hal_power_disable_otg();
     furi_message_queue_free(queue);

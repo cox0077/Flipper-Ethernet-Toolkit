@@ -3,9 +3,9 @@ App(
     name="Ethernet Toolkit",
     apptype=FlipperAppType.EXTERNAL,
     entry_point="flipper_eth_toolkit_app",
-    stack_size=4096,
-    requires=["gui"],
+    stack_size=8192,
+    requires=["gui", "storage"],
     fap_category="GPIO",
-    fap_description="W5500 DHCP and ICMP gateway ping over external SPI",
-    fap_version="0.2",
+    fap_description="W5500 DHCP, ICMP ping, ARP and TCP diagnostics with SD report",
+    fap_version="0.3",
 )
