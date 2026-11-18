@@ -1,8 +1,9 @@
 /*
- * Flipper Ethernet Toolkit v0.3 (experimental)
+ * Flipper Ethernet Toolkit v0.4 (experimental)
  * W5500 5V plug-in module on external SPI; Momentum mntm-012.
  * DHCP/UDP socket 0, gateway ICMP echo/IPRAW socket 1.
  * ARP/MACRAW socket 0 (while DHCP is idle), TCP scan socket 2.
+ * DNS UDP socket 3, Wake-on-LAN UDP socket 4. Network diagnostics for authorized LANs.
  * SPDX-License-Identifier: MIT
  */
 #include <furi.h>
@@ -22,19 +23,24 @@
 
 #define SPI_TIMEOUT 100U
 #define SPI_CHUNK 128U
-#define PAGES 7U
+#define PAGES 11U
 #define ARP_LIMIT 48U
 #define ARP_SPACING_MS 130U
 #define TCP_TIMEOUT_MS 1200U
 #define TCP_PORT_COUNT 10U
 #define REPORT_DIR "/ext/apps_data/flipper_eth_toolkit"
 #define REPORT_FILE REPORT_DIR "/report.txt"
+#define CSV_FILE REPORT_DIR "/report.csv"
+#define DNS_TIMEOUT_MS 2200U
+#define DNS_NAME_COUNT 3U
 #define DHCP_TIMEOUT_MS 4500U
 #define PING_TIMEOUT_MS 1800U
 #define S_DHCP 0U
 #define S_PING 1U
 #define S_TCP 2U
 #define S_ARP 0U
+#define S_DNS 3U
+#define S_WOL 4U
 
 /* W5500 common registers */
 #define REG_GAR 0x0001U
@@ -208,6 +214,8 @@ static const uint16_t tcp_ports[TCP_PORT_COUNT] = {21,22,23,53,80,139,443,445,33
 
 typedef enum {D_IDLE, D_OFFER, D_ACK, D_LEASE, D_FAIL} DHCPStage;
 typedef enum {P_IDLE, P_WAIT, P_OK, P_TIMEOUT, P_FAIL} PingStage;
+typedef enum {DNS_IDLE, DNS_WAIT, DNS_OK, DNS_TIMEOUT, DNS_FAIL, DNS_NXDOMAIN} DnsStage;
+static const char* dns_names[DNS_NAME_COUNT]={"example.com","github.com","openai.com"};
 typedef struct {
     uint8_t version, phy, mac[6], ip[4], mask[4], gateway[4], dns[4];
     bool found, otg_ok;
@@ -230,12 +238,29 @@ typedef struct {
     ScanStage tcp_stage;
     uint8_t tcp_index, tcp_view, tcp_target_index;
     uint8_t tcp_target_ip[4];
+    uint8_t tcp_standard_ip[4], tcp_custom_ip[4];
     uint32_t tcp_deadline;
     uint16_t prior_rtr;
     uint8_t prior_rcr;
     bool timeout_cfg_saved;
     PortResult tcp_results[TCP_PORT_COUNT];
     bool sd_ok, sd_attempted;
+    bool csv_ok, csv_attempted;
+    /* DNS: one IPv4 A lookup at a time; domain chosen from presets. */
+    uint8_t dns_choice;
+    DnsStage dns_stage;
+    uint16_t dns_txid;
+    uint32_t dns_deadline;
+    uint8_t dns_answer[4];
+    /* WOL: last-seen ARP MAC; can wake an offline device after earlier scan. */
+    uint8_t wol_target_index;
+    bool wol_attempted, wol_ok;
+    /* Custom TCP: one selected port, otherwise the standard list. */
+    uint16_t custom_port;
+    uint8_t custom_digit;
+    PortResult custom_result;
+    bool tcp_custom;
+
 } AppState;
 
 typedef struct {
@@ -296,6 +321,8 @@ static void dhcp_fail(AppState* s) {
 static void dhcp_start(AppState* s) {
     sock_close(S_PING);
     s->ping=P_IDLE;
+    sock_close(S_DNS);
+    s->dns_stage=DNS_IDLE;
     s->dhcp=D_IDLE;
     memset(s->ip,0,4); memset(s->mask,0,4);
     memset(s->gateway,0,4); memset(s->dns,0,4);
@@ -421,6 +448,127 @@ static void ping_tick(AppState* s) {
     if(expired(s->ping_deadline)) { s->ping=P_TIMEOUT; sock_close(S_PING); }
 }
 
+/* DNS query: one question (A/IN), response validated by ID, QR and source. */
+static bool network_busy(const AppState* s) {
+    return s->dhcp==D_OFFER || s->dhcp==D_ACK ||
+           s->arp_stage==SCAN_ACTIVE || s->arp_stage==SCAN_DRAIN ||
+           s->tcp_stage==SCAN_ACTIVE || s->ping==P_WAIT || s->dns_stage==DNS_WAIT;
+}
+static void dns_start(AppState* s) {
+    if(network_busy(s)) return;
+    s->dns_stage=DNS_IDLE;
+    memset(s->dns_answer,0,4);
+    if(s->dhcp!=D_LEASE || zero_ip(s->dns) || !(s->phy&1)) {
+        s->dns_stage=DNS_FAIL;return;
+    }
+    if(!sock_open(S_DNS,MODE_UDP,53053,0)) {
+        s->dns_stage=DNS_FAIL;return;
+    }
+    uint8_t packet[128]={0};
+    s->dns_txid=(uint16_t)(furi_get_tick() ^ s->dhcp_xid ^ 0xD531U);
+    packet[0]=(uint8_t)(s->dns_txid>>8);
+    packet[1]=(uint8_t)s->dns_txid;
+    packet[2]=1; /* RD (recursion desired) */
+    packet[5]=1; /* QDCOUNT = 1 */
+    const char* name=dns_names[s->dns_choice];
+    size_t pos=12;
+    while(*name) {
+        const char* dot=strchr(name,'.');
+        size_t len=dot?(size_t)(dot-name):strlen(name);
+        if(!len || len>63 || pos+len+6>sizeof(packet)) {
+            s->dns_stage=DNS_FAIL;sock_close(S_DNS);return;
+        }
+        packet[pos++]=(uint8_t)len;
+        memcpy(packet+pos,name,len);pos+=len;
+        name+=len;
+        if(*name=='.') name++;
+    }
+    packet[pos++]=0;
+    packet[pos++]=0;packet[pos++]=1; /* TYPE A */
+    packet[pos++]=0;packet[pos++]=1; /* CLASS IN */
+    if(!sock_send(S_DNS,packet,(uint16_t)pos,s->dns,53)) {
+        sock_close(S_DNS);s->dns_stage=DNS_FAIL;return;
+    }
+    s->dns_stage=DNS_WAIT;
+    s->dns_deadline=after_ms(DNS_TIMEOUT_MS);
+}
+/* Skip a compressed or plain DNS name without following pointers. */
+static bool dns_skip_name(const uint8_t* b, size_t n, size_t* off) {
+    size_t p=*off;
+    for(size_t steps=0;steps<128 && p<n;steps++) {
+        uint8_t len=b[p++];
+        if(len==0) {*off=p;return true;}
+        if((len&0xC0U)==0xC0U) {
+            if(p>=n) return false;
+            *off=p+1;return true;
+        }
+        if((len&0xC0U)!=0 || p+len>n) return false;
+        p+=len;
+    }
+    return false;
+}
+static void dns_tick(AppState* s) {
+    if(s->dns_stage!=DNS_WAIT) return;
+    uint8_t payload[512];
+    for(unsigned i=0;i<3;i++) {
+        uint16_t n=0; uint8_t src[4]={0};
+        int got=sock_receive(S_DNS,true,payload,sizeof(payload),&n,src);
+        if(got<0) {s->dns_stage=DNS_FAIL; sock_close(S_DNS);return;}
+        if(got==0) break;
+        if(n<12 || memcmp(src,s->dns,4)!=0) continue;
+        if(payload[0]!=(uint8_t)(s->dns_txid>>8) || payload[1]!=(uint8_t)s->dns_txid) continue;
+        if(!(payload[2]&0x80U) || (payload[2]&0x78U)) continue;
+        if(payload[3]&0x0FU) {
+            s->dns_stage=(payload[3]&0x0FU)==3?DNS_NXDOMAIN:DNS_FAIL;
+            sock_close(S_DNS);return;
+        }
+        uint16_t questions=(uint16_t)(payload[4]<<8|payload[5]);
+        uint16_t answers=(uint16_t)(payload[6]<<8|payload[7]);
+        if(questions!=1) {s->dns_stage=DNS_FAIL;sock_close(S_DNS);return;}
+        size_t pos=12;
+        if(!dns_skip_name(payload,n,&pos) || pos+4>n) {
+            s->dns_stage=DNS_FAIL;sock_close(S_DNS);return;
+        }
+        pos+=4;
+        bool found=false;
+        for(uint16_t a=0;a<answers && a<32;a++) {
+            if(!dns_skip_name(payload,n,&pos) || pos+10>n) break;
+            uint16_t type=(uint16_t)(payload[pos]<<8|payload[pos+1]);
+            uint16_t klass=(uint16_t)(payload[pos+2]<<8|payload[pos+3]);
+            uint16_t data_len=(uint16_t)(payload[pos+8]<<8|payload[pos+9]);
+            pos+=10;
+            if(pos+data_len>n) break;
+            if(type==1 && klass==1 && data_len==4) {
+                memcpy(s->dns_answer,payload+pos,4);
+                found=true;break;
+            }
+            pos+=data_len;
+        }
+        s->dns_stage=found?DNS_OK:DNS_FAIL;
+        sock_close(S_DNS);return;
+    }
+    if(expired(s->dns_deadline)) {
+        s->dns_stage=DNS_TIMEOUT;
+        sock_close(S_DNS);
+    }
+}
+/* UDP magic packet for Wake-on-LAN: broadcast, 6 x FF + 16 copies of MAC. */
+static void wol_send(AppState* s) {
+    if(network_busy(s)) return;
+    s->wol_attempted=true;
+    s->wol_ok=false;
+    if(s->dhcp!=D_LEASE || !(s->phy&1) || s->arp_count==0 ||
+       s->wol_target_index>=s->arp_count) return;
+    uint8_t packet[102];
+    memset(packet,0xFF,6);
+    for(uint8_t i=0;i<16;i++)
+        memcpy(packet+6+6*i,s->hosts[s->wol_target_index].mac,6);
+    if(!sock_open(S_WOL,MODE_UDP,49152,0)) return;
+    const uint8_t broadcast[4]={255,255,255,255};
+    s->wol_ok=sock_send(S_WOL,packet,sizeof(packet),broadcast,9);
+    sock_close(S_WOL);
+}
+
 /* Ethernet RAW frames: W5500 prepends a two-byte length, including itself.
  * Only first 42 bytes needed for ARP replies; consume entire RX packet.
  * Returns 1 frame, 0 no frame/bad frame, -1 read error.
@@ -498,9 +646,13 @@ static void arp_stop(AppState* s, bool err) {
 static void arp_start(AppState* s) {
     if(s->arp_stage==SCAN_ACTIVE || s->arp_stage==SCAN_DRAIN) return;
     s->arp_count=0; s->arp_view=0; s->arp_sent=0; s->arp_probe=1;
+    s->wol_target_index=0; s->wol_attempted=false;
     s->tcp_target_index=0;
     s->tcp_stage=SCAN_IDLE;
     s->tcp_index=0;
+    memset(s->tcp_standard_ip,0,4);
+    memset(s->tcp_custom_ip,0,4);
+    s->custom_result=PORT_NOT_TESTED;
     memset(s->tcp_results,0,sizeof(s->tcp_results));
     if(s->dhcp!=D_LEASE || !s->found || !(s->phy&1) ||
        zero_ip(s->ip) || zero_ip(s->mask)) {
@@ -577,7 +729,7 @@ static bool tcp_begin_port(AppState* s) {
     if(!sw8(sock,SN_MR,MODE_TCP) ||
        !sw16(sock,SN_PORT,(uint16_t)(40000U+s->tcp_index)) ||
        !reg_write(sblock(sock),SN_DIPR,s->tcp_target_ip,4) ||
-       !sw16(sock,SN_DPORT,tcp_ports[s->tcp_index]) ||
+       !sw16(sock,SN_DPORT,s->tcp_custom?s->custom_port:tcp_ports[s->tcp_index]) ||
        !command(sock,CR_OPEN)) return false;
     uint8_t status=0;
     if(!sn8(sock,SN_SR,&status) || status!=SOCK_INIT) return false;
@@ -585,10 +737,12 @@ static bool tcp_begin_port(AppState* s) {
     s->tcp_deadline=after_ms(TCP_TIMEOUT_MS);
     return true;
 }
-static void tcp_start(AppState* s) {
+static void tcp_start(AppState* s,bool custom) {
     if(s->tcp_stage==SCAN_ACTIVE || s->arp_stage==SCAN_ACTIVE ||
        s->arp_stage==SCAN_DRAIN) return;
-    memset(s->tcp_results,0,sizeof(s->tcp_results));
+    s->tcp_custom=custom;
+    if(custom) s->custom_result=PORT_NOT_TESTED;
+    else memset(s->tcp_results,0,sizeof(s->tcp_results));
     s->tcp_index=0; s->tcp_view=0;
     if(s->dhcp!=D_LEASE || !s->found || !(s->phy&1)) {
         s->tcp_stage=SCAN_ERROR;return;
@@ -598,6 +752,8 @@ static void tcp_start(AppState* s) {
         memcpy(s->tcp_target_ip,s->hosts[s->tcp_target_index-1].ip,4);
     else {s->tcp_stage=SCAN_ERROR;return;}
     if(zero_ip(s->tcp_target_ip)) {s->tcp_stage=SCAN_ERROR;return;}
+    if(custom) memcpy(s->tcp_custom_ip,s->tcp_target_ip,4);
+    else memcpy(s->tcp_standard_ip,s->tcp_target_ip,4);
     if(!rd16(0,REG_RTR,&s->prior_rtr) || !rd8(0,REG_RCR,&s->prior_rcr)) {
         s->tcp_stage=SCAN_ERROR;return;
     }
@@ -607,13 +763,16 @@ static void tcp_start(AppState* s) {
         tcp_stop(s,true);return;
     }
     s->tcp_stage=SCAN_ACTIVE;
-    if(!tcp_begin_port(s)) {s->tcp_results[0]=PORT_ERROR;tcp_stop(s,true);}
+    if(!tcp_begin_port(s)) {if(custom) s->custom_result=PORT_ERROR;
+        else s->tcp_results[0]=PORT_ERROR;
+        tcp_stop(s,true);}
 }
 static void tcp_tick(AppState* s) {
     if(s->tcp_stage!=SCAN_ACTIVE) return;
     uint8_t status=0,ir=0;
     if(!sn8(S_TCP,SN_SR,&status) || !sn8(S_TCP,SN_IR,&ir)) {
-        s->tcp_results[s->tcp_index]=PORT_ERROR;
+        if(s->tcp_custom) s->custom_result=PORT_ERROR;
+        else s->tcp_results[s->tcp_index]=PORT_ERROR;
         tcp_stop(s,true);return;
     }
     PortResult outcome=PORT_NOT_TESTED;
@@ -622,11 +781,15 @@ static void tcp_tick(AppState* s) {
     else if(status==0) outcome=PORT_CLOSED;
     else if(expired(s->tcp_deadline)) outcome=PORT_TIMEOUT;
     if(outcome==PORT_NOT_TESTED) return;
-    s->tcp_results[s->tcp_index]=outcome;
+    if(s->tcp_custom) s->custom_result=outcome;
+    else s->tcp_results[s->tcp_index]=outcome;
     sock_close(S_TCP);
     s->tcp_index++;
-    if(s->tcp_index>=TCP_PORT_COUNT) {tcp_stop(s,false);return;}
-    if(!tcp_begin_port(s)) {s->tcp_results[s->tcp_index]=PORT_ERROR;tcp_stop(s,true);}
+    if(s->tcp_index>=(s->tcp_custom?1U:TCP_PORT_COUNT)) {tcp_stop(s,false);return;}
+    if(!tcp_begin_port(s)) {
+        s->tcp_results[s->tcp_index]=PORT_ERROR;
+        tcp_stop(s,true);
+    }
 }
 static bool file_text(File* f, const char* b) {
     size_t len=strlen(b);
@@ -642,7 +805,7 @@ static bool save_report(AppState* s) {
     if(ok) ok=storage_file_open(f,REPORT_FILE,FSAM_WRITE,FSOM_OPEN_APPEND);
     char row[144];
     if(ok) {
-        ok=file_text(f,"\n=== Flipper Ethernet Toolkit v0.3 ===\n");
+        ok=file_text(f,"\n=== Flipper Ethernet Toolkit v0.4 ===\n");
         snprintf(row,sizeof(row),"MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
                  s->mac[0],s->mac[1],s->mac[2],s->mac[3],s->mac[4],s->mac[5]);
         ok=ok&&file_text(f,row);
@@ -665,13 +828,21 @@ static bool save_report(AppState* s) {
             ok=file_text(f,row);
         }
         snprintf(row,sizeof(row),"TCP target: %u.%u.%u.%u\n",
-                 s->tcp_target_ip[0],s->tcp_target_ip[1],
-                 s->tcp_target_ip[2],s->tcp_target_ip[3]);
+                 s->tcp_standard_ip[0],s->tcp_standard_ip[1],
+                 s->tcp_standard_ip[2],s->tcp_standard_ip[3]);
         ok=ok&&file_text(f,row);
         for(uint8_t i=0;i<TCP_PORT_COUNT && ok;i++) {
             snprintf(row,sizeof(row),"TCP %u %s\n",tcp_ports[i],port_text(s->tcp_results[i]));
             ok=file_text(f,row);
         }
+        snprintf(row,sizeof(row),"DNS %s: %u.%u.%u.%u (state %u)\n",
+                 dns_names[s->dns_choice],s->dns_answer[0],s->dns_answer[1],
+                 s->dns_answer[2],s->dns_answer[3],(unsigned)s->dns_stage);
+        ok=ok&&file_text(f,row);
+        snprintf(row,sizeof(row),"Custom TCP %u.%u.%u.%u:%u: %s\n",
+                 s->tcp_custom_ip[0],s->tcp_custom_ip[1],s->tcp_custom_ip[2],
+                 s->tcp_custom_ip[3],s->custom_port,port_text(s->custom_result));
+        ok=ok&&file_text(f,row);
         ok=ok&&file_text(f,"=== END ===\n");
         if(ok) ok=storage_file_sync(f);
     }
@@ -680,6 +851,56 @@ static bool save_report(AppState* s) {
     furi_record_close(RECORD_STORAGE);
     s->sd_attempted=true;
     s->sd_ok=ok;
+    return ok;
+}
+
+/* CSV is overwritten per export: a single, spreadsheet-friendly network snapshot. */
+static bool save_csv(AppState* s) {
+    Storage* storage=furi_record_open(RECORD_STORAGE);
+    if(!storage) return false;
+    bool ok=storage_simply_mkdir(storage,"/ext/apps_data") &&
+            storage_simply_mkdir(storage,REPORT_DIR);
+    File* f=storage_file_alloc(storage);
+    if(!f) {furi_record_close(RECORD_STORAGE);return false;}
+    if(ok) ok=storage_file_open(f,CSV_FILE,FSAM_WRITE,FSOM_CREATE_ALWAYS);
+    char row[160];
+    if(ok) {
+        ok=file_text(f,"type,ip,mac,port,status,details\n");
+        snprintf(row,sizeof(row),"DEVICE,%u.%u.%u.%u,%02X:%02X:%02X:%02X:%02X:%02X,,DHCP,%u.%u.%u.%u\n",
+                 s->ip[0],s->ip[1],s->ip[2],s->ip[3],
+                 s->mac[0],s->mac[1],s->mac[2],s->mac[3],s->mac[4],s->mac[5],
+                 s->gateway[0],s->gateway[1],s->gateway[2],s->gateway[3]);
+        ok=ok&&file_text(f,row);
+        for(uint8_t i=0;i<s->arp_count && ok;i++) {
+            const ArpHost* h=&s->hosts[i];
+            snprintf(row,sizeof(row),"ARP,%u.%u.%u.%u,%02X:%02X:%02X:%02X:%02X:%02X,,FOUND,\n",
+                     h->ip[0],h->ip[1],h->ip[2],h->ip[3],
+                     h->mac[0],h->mac[1],h->mac[2],h->mac[3],h->mac[4],h->mac[5]);
+            ok=file_text(f,row);
+        }
+        for(uint8_t i=0;i<TCP_PORT_COUNT && ok;i++) {
+            snprintf(row,sizeof(row),"TCP,%u.%u.%u.%u,,%u,%s,standard\n",
+                     s->tcp_standard_ip[0],s->tcp_standard_ip[1],
+                     s->tcp_standard_ip[2],s->tcp_standard_ip[3],
+                     tcp_ports[i],port_text(s->tcp_results[i]));
+            ok=file_text(f,row);
+        }
+        snprintf(row,sizeof(row),"TCP,%u.%u.%u.%u,,%u,%s,custom\n",
+                 s->tcp_custom_ip[0],s->tcp_custom_ip[1],
+                 s->tcp_custom_ip[2],s->tcp_custom_ip[3],
+                 s->custom_port,port_text(s->custom_result));
+        ok=ok&&file_text(f,row);
+        snprintf(row,sizeof(row),"DNS,%u.%u.%u.%u,,,result,%s\n",
+                 s->dns_answer[0],s->dns_answer[1],s->dns_answer[2],s->dns_answer[3],
+                 dns_names[s->dns_choice]);
+        ok=ok&&file_text(f,row);
+        if(ok) ok=storage_file_sync(f);
+    }
+    (void)storage_file_close(f);
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    s->csv_attempted=true;
+    s->csv_ok=ok;
     return ok;
 }
 
@@ -695,7 +916,7 @@ static void app_draw(Canvas* canvas, void* ctx) {
     char line[64], ip[20];
     canvas_clear(canvas);
     canvas_set_font(canvas,FontPrimary);
-    canvas_draw_str(canvas,2,11,"Eth Toolkit v0.3");
+    canvas_draw_str(canvas,2,11,"Eth Toolkit v0.4");
     canvas_draw_line(canvas,0,14,127,14);
     canvas_set_font(canvas,FontSecondary);
     if(s.page==0) {
@@ -757,28 +978,78 @@ static void app_draw(Canvas* canvas, void* ctx) {
         }
     } else if(s.page==5) {
         const char* st="OK = scan TCP";
-        if(s.tcp_stage==SCAN_ACTIVE) st="TCP: scanning...";
-        if(s.tcp_stage==SCAN_DONE) st="TCP: complete";
-        if(s.tcp_stage==SCAN_ERROR) st="TCP: error / DHCP";
+        if(s.tcp_stage==SCAN_ACTIVE && !s.tcp_custom) st="TCP: scanning...";
+        if(s.tcp_stage==SCAN_DONE && !s.tcp_custom) st="TCP: complete";
+        if(s.tcp_stage==SCAN_ERROR && !s.tcp_custom) st="TCP: error / DHCP";
         canvas_draw_str(canvas,2,23,st);
         const uint8_t* target=s.tcp_target_index==0?s.gateway:
               (s.tcp_target_index<=s.arp_count?s.hosts[s.tcp_target_index-1].ip:s.gateway);
-        if(s.tcp_stage!=SCAN_IDLE) target=s.tcp_target_ip;
+        if(!zero_ip(s.tcp_standard_ip)) target=s.tcp_standard_ip;
         ip_string(ip,sizeof(ip),target);
         snprintf(line,sizeof(line),"Target: %s",ip);
         canvas_draw_str(canvas,2,33,line);
         uint8_t open=0;
         for(uint8_t i=0;i<TCP_PORT_COUNT;i++) if(s.tcp_results[i]==PORT_OPEN) open++;
-        snprintf(line,sizeof(line),"%u/%u  OPEN: %u",s.tcp_index,TCP_PORT_COUNT,open);
+        uint8_t tested=0;
+        for(uint8_t i=0;i<TCP_PORT_COUNT;i++)
+            if(s.tcp_results[i]!=PORT_NOT_TESTED) tested++;
+        snprintf(line,sizeof(line),"%u/%u  OPEN: %u",tested,TCP_PORT_COUNT,open);
         canvas_draw_str(canvas,2,43,line);
         snprintf(line,sizeof(line),"%u: %s",tcp_ports[s.tcp_view],port_text(s.tcp_results[s.tcp_view]));
         canvas_draw_str(canvas,2,53,line);
-    } else {
+    } else if(s.page==6) {
         canvas_draw_str(canvas,2,24,"microSD report.txt");
         canvas_draw_str(canvas,2,36,"OK = append report");
         const char* st="Ready";
         if(s.sd_attempted) st=s.sd_ok?"Saved successfully":"Save failed (SD?)";
         canvas_draw_str(canvas,2,50,st);
+    } else if(s.page==7) {
+        canvas_draw_str(canvas,2,23,"DNS Lookup (UP/DOWN)");
+        canvas_draw_str(canvas,2,34,dns_names[s.dns_choice]);
+        const char* st="OK = query A record";
+        if(s.dns_stage==DNS_WAIT) st="DNS: resolving...";
+        if(s.dns_stage==DNS_FAIL) st="DNS: failed";
+        if(s.dns_stage==DNS_TIMEOUT) st="DNS: timeout";
+        if(s.dns_stage==DNS_NXDOMAIN) st="DNS: NXDOMAIN";
+        if(s.dns_stage==DNS_OK) {
+            ip_string(ip,sizeof(ip),s.dns_answer);
+            snprintf(line,sizeof(line),"A: %s",ip);st=line;
+        }
+        canvas_draw_str(canvas,2,47,st);
+    } else if(s.page==8) {
+        canvas_draw_str(canvas,2,23,"Wake-on-LAN");
+        if(s.arp_count==0) {
+            canvas_draw_str(canvas,2,36,"Run ARP scan first");
+        } else {
+            const ArpHost* h=&s.hosts[s.wol_target_index];
+            ip_string(ip,sizeof(ip),h->ip);
+            canvas_draw_str(canvas,2,34,ip);
+            snprintf(line,sizeof(line),"MAC %02X:%02X:%02X:%02X:%02X:%02X",
+                     h->mac[0],h->mac[1],h->mac[2],h->mac[3],h->mac[4],h->mac[5]);
+            canvas_draw_str(canvas,2,44,line);
+        }
+        canvas_draw_str(canvas,2,54,s.wol_attempted?
+                        (s.wol_ok?"WOL packet sent":"WOL send failed"):
+                        "OK send / hold choose");
+    } else if(s.page==9) {
+        canvas_draw_str(canvas,2,23,"Custom TCP Port");
+        const uint8_t* target=s.tcp_target_index==0?s.gateway:
+              (s.tcp_target_index<=s.arp_count?s.hosts[s.tcp_target_index-1].ip:s.gateway);
+        if(s.custom_result!=PORT_NOT_TESTED && !zero_ip(s.tcp_custom_ip)) target=s.tcp_custom_ip;
+        ip_string(ip,sizeof(ip),target);
+        snprintf(line,sizeof(line),"Target %s",ip);
+        canvas_draw_str(canvas,2,33,line);
+        snprintf(line,sizeof(line),"Port %u  %s",s.custom_port,port_text(s.custom_result));
+        canvas_draw_str(canvas,2,44,line);
+        static const uint16_t step[5]={1,10,100,1000,10000};
+        snprintf(line,sizeof(line),"Step:%u  hold </> set",step[s.custom_digit]);
+        canvas_draw_str(canvas,2,54,line);
+    } else {
+        canvas_draw_str(canvas,2,23,"Export CSV to microSD");
+        canvas_draw_str(canvas,2,36,"OK = write report.csv");
+        canvas_draw_str(canvas,2,50,s.csv_attempted?
+                        (s.csv_ok?"Saved successfully":"Save failed (SD?)"):
+                        "Overwrite last export");
     }
     snprintf(line,sizeof(line),"< > page %u/%u  OK",(unsigned)(s.page+1),PAGES);
     canvas_draw_str(canvas,2,63,line);
@@ -804,6 +1075,7 @@ int32_t flipper_eth_toolkit_app(void* p) {
     furi_hal_spi_bus_handle_init(&furi_hal_spi_bus_handle_external);
     furi_delay_ms(150);
     generate_mac(app.s.mac);
+    app.s.custom_port=8080;
     update_physical(&app.s);
     if(app.s.found && (app.s.phy&1)) dhcp_start(&app.s);
 
@@ -826,7 +1098,37 @@ int32_t flipper_eth_toolkit_app(void* p) {
             app.s.tcp_target_index=(uint8_t)((app.s.tcp_target_index+1)%(app.s.arp_count+1));
             app.s.tcp_stage=SCAN_IDLE;
             app.s.tcp_index=0;
+            memset(app.s.tcp_standard_ip,0,4);
             memset(app.s.tcp_results,0,sizeof(app.s.tcp_results));
+        }
+        if(got==FuriStatusOk && event.type==InputTypeLong &&
+           event.key==InputKeyOk && app.s.page==8 && app.s.arp_count>0 &&
+           !network_busy(&app.s)) {
+            app.s.wol_target_index=(uint8_t)((app.s.wol_target_index+1)%app.s.arp_count);
+            app.s.wol_attempted=false;
+        }
+        if(got==FuriStatusOk && event.type==InputTypeLong &&
+           app.s.page==9 &&
+           (event.key==InputKeyLeft || event.key==InputKeyRight)) {
+            app.s.custom_digit=(uint8_t)((app.s.custom_digit +
+                (event.key==InputKeyRight?1:4))%5);
+        }
+        if(got==FuriStatusOk && event.type==InputTypeLong &&
+           event.key==InputKeyOk && app.s.page==9 &&
+           app.s.tcp_stage!=SCAN_ACTIVE) {
+            app.s.tcp_target_index=(uint8_t)((app.s.tcp_target_index+1)%(app.s.arp_count+1));
+            app.s.custom_result=PORT_NOT_TESTED;
+            memset(app.s.tcp_custom_ip,0,4);
+        }
+        if(got==FuriStatusOk && event.type==InputTypeLong && app.s.page==9 &&
+           (event.key==InputKeyUp || event.key==InputKeyDown) &&
+           app.s.tcp_stage!=SCAN_ACTIVE) {
+            static const uint16_t step[5]={1,10,100,1000,10000};
+            int next=(int)app.s.custom_port+(event.key==InputKeyUp?10:-10)*(int)step[app.s.custom_digit];
+            if(next>65535) next=65535;
+            if(next<1) next=1;
+            app.s.custom_port=(uint16_t)next;
+            app.s.custom_result=PORT_NOT_TESTED;
         }
         if(got==FuriStatusOk && event.type==InputTypeShort) {
             if(event.key==InputKeyBack) running=false;
@@ -840,21 +1142,35 @@ int32_t flipper_eth_toolkit_app(void* p) {
                 } else if(app.s.page==5) {
                     int v=(int)app.s.tcp_view+delta;
                     if(v>=0 && v<(int)TCP_PORT_COUNT) app.s.tcp_view=(uint8_t)v;
+                } else if(app.s.page==7 && app.s.dns_stage!=DNS_WAIT) {
+                    app.s.dns_choice=(uint8_t)((app.s.dns_choice+DNS_NAME_COUNT+delta)%DNS_NAME_COUNT);
+                    app.s.dns_stage=DNS_IDLE;
+                    memset(app.s.dns_answer,0,4);
+                } else if(app.s.page==9 && app.s.tcp_stage!=SCAN_ACTIVE) {
+                    static const uint16_t step[5]={1,10,100,1000,10000};
+                    int next=(int)app.s.custom_port+delta*(int)step[app.s.custom_digit];
+                    if(next>65535) next=65535;
+                    if(next<1) next=1;
+                    app.s.custom_port=(uint16_t)next;
+                    app.s.custom_result=PORT_NOT_TESTED;
                 } else app.s.page=(app.s.page+PAGES+(delta>0?1:PAGES-1))%PAGES;
             }
             else if(event.key==InputKeyOk) {
                 if(app.s.page==2 && app.s.arp_stage!=SCAN_ACTIVE &&
                    app.s.arp_stage!=SCAN_DRAIN && app.s.tcp_stage!=SCAN_ACTIVE)
                     dhcp_start(&app.s);
-                else if(app.s.page==3 && app.s.arp_stage!=SCAN_ACTIVE &&
-                        app.s.arp_stage!=SCAN_DRAIN && app.s.tcp_stage!=SCAN_ACTIVE)
+                else if(app.s.page==3 && !network_busy(&app.s))
                     ping_start(&app.s);
-                else if(app.s.page==4 && app.s.tcp_stage!=SCAN_ACTIVE)
+                else if(app.s.page==4 && !network_busy(&app.s))
                     arp_start(&app.s);
-                else if(app.s.page==5) tcp_start(&app.s);
-                else if(app.s.page==6 && app.s.arp_stage!=SCAN_ACTIVE &&
-                        app.s.arp_stage!=SCAN_DRAIN && app.s.tcp_stage!=SCAN_ACTIVE)
+                else if(app.s.page==5 && !network_busy(&app.s)) tcp_start(&app.s,false);
+                else if(app.s.page==6 && !network_busy(&app.s))
                     (void)save_report(&app.s);
+                else if(app.s.page==7) dns_start(&app.s);
+                else if(app.s.page==8) wol_send(&app.s);
+                else if(app.s.page==9 && !network_busy(&app.s)) tcp_start(&app.s,true);
+                else if(app.s.page==10 && !network_busy(&app.s))
+                    (void)save_csv(&app.s);
                 else if(app.s.page<2) update_physical(&app.s);
             }
         }
@@ -866,12 +1182,14 @@ int32_t flipper_eth_toolkit_app(void* p) {
                 if(app.s.arp_stage==SCAN_ACTIVE || app.s.arp_stage==SCAN_DRAIN)
                     arp_stop(&app.s,true);
                 if(app.s.tcp_stage==SCAN_ACTIVE) tcp_stop(&app.s,true);
+                if(app.s.dns_stage==DNS_WAIT) {sock_close(S_DNS);app.s.dns_stage=DNS_FAIL;}
             } else {
                 if(app.s.dhcp==D_IDLE) dhcp_start(&app.s);
                 dhcp_tick(&app.s);
                 ping_tick(&app.s);
                 arp_tick(&app.s);
                 tcp_tick(&app.s);
+                dns_tick(&app.s);
             }
         }
         furi_mutex_release(app.mutex);
@@ -881,6 +1199,7 @@ int32_t flipper_eth_toolkit_app(void* p) {
     view_port_free(vp);
     furi_record_close(RECORD_GUI);
     sock_close(S_DHCP); sock_close(S_PING); sock_close(S_TCP);
+    sock_close(S_DNS); sock_close(S_WOL);
     tcp_restore_timeout(&app.s);
     furi_hal_spi_bus_handle_deinit(&furi_hal_spi_bus_handle_external);
     if(!previous_5v && enabled) furi_hal_power_disable_otg();
