@@ -1,9 +1,9 @@
 /*
- * Flipper Ethernet Toolkit v0.4 (experimental)
+ * Flipper Ethernet Toolkit v0.5 (experimental)
  * W5500 5V plug-in module on external SPI; Momentum mntm-012.
  * DHCP/UDP socket 0, gateway ICMP echo/IPRAW socket 1.
  * ARP/MACRAW socket 0 (while DHCP is idle), TCP scan socket 2.
- * DNS UDP socket 3, Wake-on-LAN UDP socket 4. Network diagnostics for authorized LANs.
+ * DNS UDP socket 3, Wake-on-LAN UDP socket 4, discovery UDP socket 5.
  * SPDX-License-Identifier: MIT
  */
 #include <furi.h>
@@ -23,7 +23,10 @@
 
 #define SPI_TIMEOUT 100U
 #define SPI_CHUNK 128U
-#define PAGES 11U
+#define PAGES 13U
+#define DISC_LIMIT 12U
+#define DISC_TIMEOUT_MS 3800U
+#define S_DISC 5U
 #define ARP_LIMIT 48U
 #define ARP_SPACING_MS 130U
 #define TCP_TIMEOUT_MS 1200U
@@ -79,6 +82,8 @@
 #define SOCK_MACRAW 0x42U
 #define SOCK_UDP 0x22U
 #define SOCK_IPRAW 0x32U
+#define DISC_SSDP 0U
+#define DISC_MDNS 1U
 
 static bool expired(uint32_t deadline) {
     return (int32_t)(furi_get_tick() - deadline) >= 0;
@@ -215,6 +220,12 @@ static const uint16_t tcp_ports[TCP_PORT_COUNT] = {21,22,23,53,80,139,443,445,33
 typedef enum {D_IDLE, D_OFFER, D_ACK, D_LEASE, D_FAIL} DHCPStage;
 typedef enum {P_IDLE, P_WAIT, P_OK, P_TIMEOUT, P_FAIL} PingStage;
 typedef enum {DNS_IDLE, DNS_WAIT, DNS_OK, DNS_TIMEOUT, DNS_FAIL, DNS_NXDOMAIN} DnsStage;
+typedef enum {DISC_IDLE, DISC_WAIT, DISC_DONE, DISC_FAIL} DiscStage;
+typedef struct {
+    uint8_t ip[4];
+    char description[40];
+    uint8_t protocol;
+} DiscoveredService;
 static const char* dns_names[DNS_NAME_COUNT]={"example.com","github.com","openai.com"};
 typedef struct {
     uint8_t version, phy, mac[6], ip[4], mask[4], gateway[4], dns[4];
@@ -260,6 +271,11 @@ typedef struct {
     uint8_t custom_digit;
     PortResult custom_result;
     bool tcp_custom;
+    /* Service discovery: bounded active multicast queries, unicast replies. */
+    uint8_t disc_choice, disc_count, disc_view;
+    DiscStage disc_stage;
+    uint32_t disc_deadline;
+    DiscoveredService services[DISC_LIMIT];
 
 } AppState;
 
@@ -452,7 +468,8 @@ static void ping_tick(AppState* s) {
 static bool network_busy(const AppState* s) {
     return s->dhcp==D_OFFER || s->dhcp==D_ACK ||
            s->arp_stage==SCAN_ACTIVE || s->arp_stage==SCAN_DRAIN ||
-           s->tcp_stage==SCAN_ACTIVE || s->ping==P_WAIT || s->dns_stage==DNS_WAIT;
+           s->tcp_stage==SCAN_ACTIVE || s->ping==P_WAIT || s->dns_stage==DNS_WAIT ||
+           s->disc_stage==DISC_WAIT;
 }
 static void dns_start(AppState* s) {
     if(network_busy(s)) return;
@@ -567,6 +584,174 @@ static void wol_send(AppState* s) {
     const uint8_t broadcast[4]={255,255,255,255};
     s->wol_ok=sock_send(S_WOL,packet,sizeof(packet),broadcast,9);
     sock_close(S_WOL);
+}
+
+/* Conservative offline vendor hints: only a handful of well-known OUIs.
+ * Locally administered addresses cannot be mapped to a reliable manufacturer. */
+static const char* mac_vendor(const uint8_t mac[6]) {
+    if(mac[0] & 1U) return "Multicast";
+    if(mac[0] & 2U) return "Local/Random";
+    static const struct {uint8_t b[3];const char* vendor;} known[] = {
+        {{0xB8,0x27,0xEB},"Raspberry Pi"},
+        {{0xDC,0xA6,0x32},"Raspberry Pi"},
+        {{0x24,0x0A,0xC4},"Espressif"},
+        {{0x18,0xFE,0x34},"Espressif"},
+        {{0x00,0x1B,0x63},"Apple"},
+        {{0x00,0x1B,0x21},"Intel"},
+        {{0x4C,0x5E,0x0C},"MikroTik"},
+    };
+    for(size_t i=0; i<sizeof(known)/sizeof(known[0]); i++) {
+        if(memcmp(mac,known[i].b,3)==0) return known[i].vendor;
+    }
+    return "Unknown";
+}
+
+/* Output printable, single-line ASCII fields. No untrusted text is executed. */
+static void sanitize_label(char* out, size_t cap, const uint8_t* in, size_t n) {
+    if(!cap) return;
+    size_t used=0;
+    while(used+1<cap && n--) {
+        uint8_t c=*in++;
+        if(c==',' || c=='\r' || c=='\n' || c=='"') c=' ';
+        out[used++]=(c>=32 && c<=126)?(char)c:'?';
+    }
+    out[used]=0;
+}
+
+/* Decode a DNS name with strict pointer and packet bounds. */
+static bool dns_name_text(const uint8_t* packet, size_t n, size_t offset,
+                          char* out, size_t cap) {
+    if(!cap || offset>=n) return false;
+    size_t outlen=0;
+    size_t p=offset;
+    for(unsigned steps=0; steps<32; steps++) {
+        if(p>=n) return false;
+        uint8_t len=packet[p++];
+        if(len==0) {out[outlen]=0; return true;}
+        if((len&0xC0U)==0xC0U) {
+            if(p>=n) return false;
+            size_t target=(size_t)(((len&0x3FU)<<8)|packet[p++]);
+            if(target>=n) return false;
+            p=target;
+            continue;
+        }
+        if(len>63 || (len&0xC0U) || p+len>n) return false;
+        if(outlen && outlen+1<cap) out[outlen++]='.';
+        for(uint8_t i=0;i<len;i++) {
+            uint8_t c=packet[p+i];
+            if(outlen+1<cap) out[outlen++]=(c>=33 && c<=126 && c!=',' && c!='"')?(char)c:'_';
+        }
+        p+=len;
+    }
+    return false;
+}
+
+static void discovery_add(AppState* s, const uint8_t ip[4], const char* label) {
+    if(zero_ip(ip) || !label[0]) return;
+    for(uint8_t i=0;i<s->disc_count;i++) {
+        if(s->services[i].protocol==s->disc_choice &&
+           !memcmp(s->services[i].ip,ip,4) &&
+           !strncmp(s->services[i].description,label,sizeof(s->services[i].description))) return;
+    }
+    if(s->disc_count>=DISC_LIMIT) return;
+    DiscoveredService* h=&s->services[s->disc_count++];
+    memcpy(h->ip,ip,4);
+    h->protocol=s->disc_choice;
+    snprintf(h->description,sizeof(h->description),"%s",label);
+}
+
+static void discovery_ssdp(AppState* s, const uint8_t* b, uint16_t n, const uint8_t ip[4]) {
+    if(n<12 || memcmp(b,"HTTP/1.1 200",12)!=0) return;
+    /* Prefer the ST: header; bounded to 39 bytes and a single line. */
+    char name[40]="SSDP response";
+    size_t pos=0;
+    while(pos<n) {
+        size_t start=pos;
+        while(pos<n && b[pos]!='\n' && b[pos]!='\r') pos++;
+        size_t end=pos;
+        while(pos<n && (b[pos]=='\n' || b[pos]=='\r')) pos++;
+        if(end>=start+3 && (b[start]=='S'||b[start]=='s') &&
+           (b[start+1]=='T'||b[start+1]=='t') && b[start+2]==':') {
+            size_t v=start+3;
+            while(v<end && b[v]==' ') v++;
+            sanitize_label(name,sizeof(name),b+v,end-v);
+            break;
+        }
+    }
+    discovery_add(s,ip,name);
+}
+
+static void discovery_mdns(AppState* s, const uint8_t* b, uint16_t n, const uint8_t ip[4]) {
+    if(n<12 || !(b[2]&0x80U) || (b[2]&0x78U)) return;
+    uint16_t q=(uint16_t)((b[4]<<8)|b[5]);
+    uint16_t a=(uint16_t)((b[6]<<8)|b[7]);
+    size_t pos=12;
+    if(q>8 || a>48) return;
+    for(uint16_t i=0;i<q;i++) {
+        if(!dns_skip_name(b,n,&pos) || pos+4>n) return;
+        pos+=4;
+    }
+    for(uint16_t i=0;i<a;i++) {
+        if(!dns_skip_name(b,n,&pos) || pos+10>n) return;
+        uint16_t type=(uint16_t)((b[pos]<<8)|b[pos+1]);
+        uint16_t rdlen=(uint16_t)((b[pos+8]<<8)|b[pos+9]);
+        pos+=10;
+        if(pos+rdlen>n) return;
+        if(type==12 && rdlen>0) {
+            char name[40];
+            if(dns_name_text(b,n,pos,name,sizeof(name))) discovery_add(s,ip,name);
+        }
+        pos+=rdlen;
+    }
+}
+
+static void discovery_start(AppState* s) {
+    if(network_busy(s)) return;
+    s->disc_count=0;
+    s->disc_view=0;
+    s->disc_stage=DISC_FAIL;
+    if(s->dhcp!=D_LEASE || !(s->phy&1)) return;
+    uint16_t src_port=s->disc_choice==DISC_SSDP?49055U:49056U;
+    if(!sock_open(S_DISC,MODE_UDP,src_port,0)) return;
+    bool ok=false;
+    if(s->disc_choice==DISC_SSDP) {
+        static const uint8_t dst[4]={239,255,255,250};
+        static const char query[]="M-SEARCH * HTTP/1.1\r\n"
+            "HOST: 239.255.255.250:1900\r\n"
+            "MAN: \"ssdp:discover\"\r\n"
+            "MX: 1\r\nST: ssdp:all\r\n\r\n";
+        ok=sock_send(S_DISC,(const uint8_t*)query,(uint16_t)(sizeof(query)-1),dst,1900);
+    } else {
+        static const uint8_t dst[4]={224,0,0,251};
+        static const uint8_t q[]={
+            0x32,0x51, 0x00,0x00, 0x00,0x01, 0x00,0x00, 0x00,0x00, 0x00,0x00,
+            9,'_','s','e','r','v','i','c','e','s',
+            7,'_','d','n','s','-','s','d',4,'_','u','d','p',5,'l','o','c','a','l',0,
+            0,12,0,1
+        };
+        /* Legacy unicast reply requested by using a non-5353 source port. */
+        ok=sock_send(S_DISC,q,sizeof(q),dst,5353);
+    }
+    if(!ok) {sock_close(S_DISC);return;}
+    s->disc_stage=DISC_WAIT;
+    s->disc_deadline=after_ms(DISC_TIMEOUT_MS);
+}
+
+static void discovery_tick(AppState* s) {
+    if(s->disc_stage!=DISC_WAIT) return;
+    uint8_t b[850],ip[4];
+    for(unsigned i=0;i<4;i++) {
+        uint16_t n=0;
+        int received=sock_receive(S_DISC,true,b,sizeof(b),&n,ip);
+        if(received<0) {s->disc_stage=DISC_FAIL;sock_close(S_DISC);return;}
+        if(received==0) break;
+        if(s->disc_choice==DISC_SSDP) discovery_ssdp(s,b,n,ip);
+        else discovery_mdns(s,b,n,ip);
+    }
+    if(expired(s->disc_deadline)) {
+        s->disc_stage=DISC_DONE;
+        sock_close(S_DISC);
+    }
 }
 
 /* Ethernet RAW frames: W5500 prepends a two-byte length, including itself.
@@ -805,7 +990,7 @@ static bool save_report(AppState* s) {
     if(ok) ok=storage_file_open(f,REPORT_FILE,FSAM_WRITE,FSOM_OPEN_APPEND);
     char row[144];
     if(ok) {
-        ok=file_text(f,"\n=== Flipper Ethernet Toolkit v0.4 ===\n");
+        ok=file_text(f,"\n=== Flipper Ethernet Toolkit v0.5 ===\n");
         snprintf(row,sizeof(row),"MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
                  s->mac[0],s->mac[1],s->mac[2],s->mac[3],s->mac[4],s->mac[5]);
         ok=ok&&file_text(f,row);
@@ -822,9 +1007,9 @@ static bool save_report(AppState* s) {
         ok=ok&&file_text(f,row);
         for(uint8_t i=0;i<s->arp_count && ok;i++) {
             const ArpHost* h=&s->hosts[i];
-            snprintf(row,sizeof(row),"ARP %u.%u.%u.%u %02X:%02X:%02X:%02X:%02X:%02X\n",
+            snprintf(row,sizeof(row),"ARP %u.%u.%u.%u %02X:%02X:%02X:%02X:%02X:%02X (%s)\n",
                      h->ip[0],h->ip[1],h->ip[2],h->ip[3],h->mac[0],h->mac[1],
-                     h->mac[2],h->mac[3],h->mac[4],h->mac[5]);
+                     h->mac[2],h->mac[3],h->mac[4],h->mac[5],mac_vendor(h->mac));
             ok=file_text(f,row);
         }
         snprintf(row,sizeof(row),"TCP target: %u.%u.%u.%u\n",
@@ -843,6 +1028,13 @@ static bool save_report(AppState* s) {
                  s->tcp_custom_ip[0],s->tcp_custom_ip[1],s->tcp_custom_ip[2],
                  s->tcp_custom_ip[3],s->custom_port,port_text(s->custom_result));
         ok=ok&&file_text(f,row);
+        for(uint8_t i=0;i<s->disc_count && ok;i++) {
+            const DiscoveredService* h=&s->services[i];
+            snprintf(row,sizeof(row),"SERVICE %s %u.%u.%u.%u %s\n",
+                     h->protocol==DISC_SSDP?"SSDP":"mDNS",
+                     h->ip[0],h->ip[1],h->ip[2],h->ip[3],h->description);
+            ok=file_text(f,row);
+        }
         ok=ok&&file_text(f,"=== END ===\n");
         if(ok) ok=storage_file_sync(f);
     }
@@ -873,9 +1065,9 @@ static bool save_csv(AppState* s) {
         ok=ok&&file_text(f,row);
         for(uint8_t i=0;i<s->arp_count && ok;i++) {
             const ArpHost* h=&s->hosts[i];
-            snprintf(row,sizeof(row),"ARP,%u.%u.%u.%u,%02X:%02X:%02X:%02X:%02X:%02X,,FOUND,\n",
+            snprintf(row,sizeof(row),"ARP,%u.%u.%u.%u,%02X:%02X:%02X:%02X:%02X:%02X,,FOUND,%s\n",
                      h->ip[0],h->ip[1],h->ip[2],h->ip[3],
-                     h->mac[0],h->mac[1],h->mac[2],h->mac[3],h->mac[4],h->mac[5]);
+                     h->mac[0],h->mac[1],h->mac[2],h->mac[3],h->mac[4],h->mac[5],mac_vendor(h->mac));
             ok=file_text(f,row);
         }
         for(uint8_t i=0;i<TCP_PORT_COUNT && ok;i++) {
@@ -894,6 +1086,13 @@ static bool save_csv(AppState* s) {
                  s->dns_answer[0],s->dns_answer[1],s->dns_answer[2],s->dns_answer[3],
                  dns_names[s->dns_choice]);
         ok=ok&&file_text(f,row);
+        for(uint8_t i=0;i<s->disc_count && ok;i++) {
+            const DiscoveredService* h=&s->services[i];
+            snprintf(row,sizeof(row),"SERVICE,%u.%u.%u.%u,,,%.5s,%s\n",
+                     h->ip[0],h->ip[1],h->ip[2],h->ip[3],
+                     h->protocol==DISC_SSDP?"SSDP":"mDNS",h->description);
+            ok=file_text(f,row);
+        }
         if(ok) ok=storage_file_sync(f);
     }
     (void)storage_file_close(f);
@@ -916,7 +1115,7 @@ static void app_draw(Canvas* canvas, void* ctx) {
     char line[64], ip[20];
     canvas_clear(canvas);
     canvas_set_font(canvas,FontPrimary);
-    canvas_draw_str(canvas,2,11,"Eth Toolkit v0.4");
+    canvas_draw_str(canvas,2,11,"Eth Toolkit v0.5");
     canvas_draw_line(canvas,0,14,127,14);
     canvas_set_font(canvas,FontSecondary);
     if(s.page==0) {
@@ -1044,12 +1243,38 @@ static void app_draw(Canvas* canvas, void* ctx) {
         static const uint16_t step[5]={1,10,100,1000,10000};
         snprintf(line,sizeof(line),"Step:%u  hold </> set",step[s.custom_digit]);
         canvas_draw_str(canvas,2,54,line);
-    } else {
+    } else if(s.page==10) {
         canvas_draw_str(canvas,2,23,"Export CSV to microSD");
         canvas_draw_str(canvas,2,36,"OK = write report.csv");
         canvas_draw_str(canvas,2,50,s.csv_attempted?
                         (s.csv_ok?"Saved successfully":"Save failed (SD?)"):
                         "Overwrite last export");
+    } else if(s.page==11) {
+        snprintf(line,sizeof(line),"Discovery %s",s.disc_choice==DISC_SSDP?"SSDP":"mDNS");
+        canvas_draw_str(canvas,2,23,line);
+        const char* status=s.disc_stage==DISC_WAIT?"Receiving replies...":
+                           s.disc_stage==DISC_DONE?"Scan finished":
+                           s.disc_stage==DISC_FAIL?"Network/send error":"OK start / UP change";
+        canvas_draw_str(canvas,2,34,status);
+        snprintf(line,sizeof(line),"Found: %u (max %u)",s.disc_count,DISC_LIMIT);
+        canvas_draw_str(canvas,2,44,line);
+        if(s.disc_count) {
+            const DiscoveredService* host=&s.services[s.disc_view];
+            ip_string(ip,sizeof(ip),host->ip);
+            snprintf(line,sizeof(line),"%s %s",ip,host->description);
+            canvas_draw_str(canvas,2,54,line);
+        }
+    } else {
+        canvas_draw_str(canvas,2,23,"Network inventory");
+        snprintf(line,sizeof(line),"ARP hosts %u",s.arp_count);
+        canvas_draw_str(canvas,2,33,line);
+        if(s.arp_count) {
+            const ArpHost* host=&s.hosts[s.arp_view];
+            ip_string(ip,sizeof(ip),host->ip);
+            canvas_draw_str(canvas,2,43,ip);
+            snprintf(line,sizeof(line),"Vendor: %s",mac_vendor(host->mac));
+            canvas_draw_str(canvas,2,53,line);
+        } else canvas_draw_str(canvas,2,43,"Run ARP scan (page 5)");
     }
     snprintf(line,sizeof(line),"< > page %u/%u  OK",(unsigned)(s.page+1),PAGES);
     canvas_draw_str(canvas,2,63,line);
@@ -1146,6 +1371,18 @@ int32_t flipper_eth_toolkit_app(void* p) {
                     app.s.dns_choice=(uint8_t)((app.s.dns_choice+DNS_NAME_COUNT+delta)%DNS_NAME_COUNT);
                     app.s.dns_stage=DNS_IDLE;
                     memset(app.s.dns_answer,0,4);
+                } else if(app.s.page==11 && app.s.disc_stage!=DISC_WAIT) {
+                    if(event.key==InputKeyUp) {
+                        app.s.disc_choice=app.s.disc_choice==DISC_SSDP?DISC_MDNS:DISC_SSDP;
+                        app.s.disc_stage=DISC_IDLE;
+                        app.s.disc_count=0;
+                        app.s.disc_view=0;
+                    } else if(app.s.disc_count) {
+                        app.s.disc_view=(uint8_t)((app.s.disc_view+1)%app.s.disc_count);
+                    }
+                } else if(app.s.page==12) {
+                    int v=(int)app.s.arp_view+delta;
+                    if(v>=0 && v<(int)app.s.arp_count) app.s.arp_view=(uint8_t)v;
                 } else if(app.s.page==9 && app.s.tcp_stage!=SCAN_ACTIVE) {
                     static const uint16_t step[5]={1,10,100,1000,10000};
                     int next=(int)app.s.custom_port+delta*(int)step[app.s.custom_digit];
@@ -1171,6 +1408,8 @@ int32_t flipper_eth_toolkit_app(void* p) {
                 else if(app.s.page==9 && !network_busy(&app.s)) tcp_start(&app.s,true);
                 else if(app.s.page==10 && !network_busy(&app.s))
                     (void)save_csv(&app.s);
+                else if(app.s.page==11 && !network_busy(&app.s))
+                    discovery_start(&app.s);
                 else if(app.s.page<2) update_physical(&app.s);
             }
         }
@@ -1183,6 +1422,7 @@ int32_t flipper_eth_toolkit_app(void* p) {
                     arp_stop(&app.s,true);
                 if(app.s.tcp_stage==SCAN_ACTIVE) tcp_stop(&app.s,true);
                 if(app.s.dns_stage==DNS_WAIT) {sock_close(S_DNS);app.s.dns_stage=DNS_FAIL;}
+                if(app.s.disc_stage==DISC_WAIT) {sock_close(S_DISC);app.s.disc_stage=DISC_FAIL;}
             } else {
                 if(app.s.dhcp==D_IDLE) dhcp_start(&app.s);
                 dhcp_tick(&app.s);
@@ -1190,6 +1430,7 @@ int32_t flipper_eth_toolkit_app(void* p) {
                 arp_tick(&app.s);
                 tcp_tick(&app.s);
                 dns_tick(&app.s);
+                discovery_tick(&app.s);
             }
         }
         furi_mutex_release(app.mutex);
@@ -1199,7 +1440,7 @@ int32_t flipper_eth_toolkit_app(void* p) {
     view_port_free(vp);
     furi_record_close(RECORD_GUI);
     sock_close(S_DHCP); sock_close(S_PING); sock_close(S_TCP);
-    sock_close(S_DNS); sock_close(S_WOL);
+    sock_close(S_DNS); sock_close(S_WOL); sock_close(S_DISC);
     tcp_restore_timeout(&app.s);
     furi_hal_spi_bus_handle_deinit(&furi_hal_spi_bus_handle_external);
     if(!previous_5v && enabled) furi_hal_power_disable_otg();
