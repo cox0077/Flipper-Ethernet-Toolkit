@@ -6,6 +6,6 @@ App(
     stack_size=8192,
     requires=["gui", "storage"],
     fap_category="GPIO",
-    fap_description="W5500 DHCP Ping ARP TCP DNS WOL, discovery and microSD exports",
-    fap_version="0.5",
+    fap_description="W5500 DHCP Ping ARP TCP DNS WoL discovery inventory monitor SD",
+    fap_version="0.6",
 )

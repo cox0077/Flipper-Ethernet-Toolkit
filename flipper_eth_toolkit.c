@@ -1,5 +1,5 @@
 /*
- * Flipper Ethernet Toolkit v0.5 (experimental)
+ * Flipper Ethernet Toolkit v0.6 (experimental)
  * W5500 5V plug-in module on external SPI; Momentum mntm-012.
  * DHCP/UDP socket 0, gateway ICMP echo/IPRAW socket 1.
  * ARP/MACRAW socket 0 (while DHCP is idle), TCP scan socket 2.
@@ -23,7 +23,9 @@
 
 #define SPI_TIMEOUT 100U
 #define SPI_CHUNK 128U
-#define PAGES 13U
+#define PAGES 14U
+#define CHANGE_LIMIT 48U
+#define CHANGES_FILE REPORT_DIR "/changes.csv"
 #define DISC_LIMIT 12U
 #define DISC_TIMEOUT_MS 3800U
 #define S_DISC 5U
@@ -221,6 +223,12 @@ typedef enum {D_IDLE, D_OFFER, D_ACK, D_LEASE, D_FAIL} DHCPStage;
 typedef enum {P_IDLE, P_WAIT, P_OK, P_TIMEOUT, P_FAIL} PingStage;
 typedef enum {DNS_IDLE, DNS_WAIT, DNS_OK, DNS_TIMEOUT, DNS_FAIL, DNS_NXDOMAIN} DnsStage;
 typedef enum {DISC_IDLE, DISC_WAIT, DISC_DONE, DISC_FAIL} DiscStage;
+typedef enum {CHANGE_NEW, CHANGE_GONE, CHANGE_MAC} ChangeKind;
+typedef struct {
+    uint8_t ip[4];
+    uint8_t before[6], after[6];
+    ChangeKind kind;
+} NetworkChange;
 typedef struct {
     uint8_t ip[4];
     char description[40];
@@ -276,6 +284,15 @@ typedef struct {
     DiscStage disc_stage;
     uint32_t disc_deadline;
     DiscoveredService services[DISC_LIMIT];
+    /* Compare the last two successful complete ARP scans in this session. */
+    ArpHost baseline[ARP_LIMIT];
+    uint8_t baseline_count;
+    uint8_t baseline_prefix[3], baseline_mask[4];
+    bool baseline_valid, monitor_compared, monitor_partial, monitor_error;
+    uint32_t monitor_scan_number, monitor_saved_number;
+    uint8_t monitor_new, monitor_gone, monitor_mac, monitor_event_count, monitor_event_view;
+    NetworkChange monitor_events[CHANGE_LIMIT];
+    bool monitor_save_attempted, monitor_save_ok;
 
 } AppState;
 
@@ -824,13 +841,71 @@ static void arp_keep_reply(AppState* s, const uint8_t* f, uint16_t n) {
     memcpy(host->ip,f+28,4);
     memcpy(host->mac,f+22,6);
 }
+/* Scan comparisons are observations, not proof that a host is offline.
+ * Never compare truncated (ARP_LIMIT) lists: results might be misleading. */
+static void monitor_change(AppState* s, ChangeKind kind, const uint8_t ip[4],
+                           const uint8_t before[6], const uint8_t after[6]) {
+    if(kind==CHANGE_NEW) s->monitor_new++;
+    else if(kind==CHANGE_GONE) s->monitor_gone++;
+    else s->monitor_mac++;
+    if(s->monitor_event_count>=CHANGE_LIMIT) return;
+    NetworkChange* e=&s->monitor_events[s->monitor_event_count++];
+    e->kind=kind;
+    memcpy(e->ip,ip,4);
+    if(before) memcpy(e->before,before,6); else memset(e->before,0,6);
+    if(after) memcpy(e->after,after,6); else memset(e->after,0,6);
+}
+static void monitor_scan_complete(AppState* s) {
+    s->monitor_scan_number++;
+    s->monitor_new=0; s->monitor_gone=0; s->monitor_mac=0;
+    s->monitor_event_count=0; s->monitor_event_view=0;
+    s->monitor_save_attempted=false; s->monitor_save_ok=false;
+    s->monitor_error=false;
+    s->monitor_partial=(s->arp_count>=ARP_LIMIT);
+    bool same_network=s->baseline_valid &&
+        memcmp(s->baseline_prefix,s->ip,3)==0 &&
+        memcmp(s->baseline_mask,s->mask,4)==0;
+    s->monitor_compared=false;
+    if(same_network && !s->monitor_partial && s->baseline_count<ARP_LIMIT) {
+        s->monitor_compared=true;
+        for(uint8_t i=0;i<s->arp_count;i++) {
+            const ArpHost* h=&s->hosts[i];
+            const ArpHost* prev=NULL;
+            for(uint8_t j=0;j<s->baseline_count;j++) {
+                if(memcmp(s->baseline[j].ip,h->ip,4)==0) {
+                    prev=&s->baseline[j]; break;
+                }
+            }
+            if(!prev) monitor_change(s,CHANGE_NEW,h->ip,NULL,h->mac);
+            else if(memcmp(prev->mac,h->mac,6)!=0)
+                monitor_change(s,CHANGE_MAC,h->ip,prev->mac,h->mac);
+        }
+        for(uint8_t i=0;i<s->baseline_count;i++) {
+            const ArpHost* h=&s->baseline[i];
+            bool seen=false;
+            for(uint8_t j=0;j<s->arp_count;j++) {
+                if(memcmp(h->ip,s->hosts[j].ip,4)==0) {seen=true;break;}
+            }
+            if(!seen) monitor_change(s,CHANGE_GONE,h->ip,h->mac,NULL);
+        }
+    }
+    /* Establish a new baseline after a successful, non-truncated scan. */
+    s->baseline_valid=!s->monitor_partial;
+    s->baseline_count=s->arp_count;
+    memcpy(s->baseline,s->hosts,sizeof(ArpHost)*s->arp_count);
+    memcpy(s->baseline_prefix,s->ip,3);
+    memcpy(s->baseline_mask,s->mask,4);
+}
 static void arp_stop(AppState* s, bool err) {
     sock_close(S_ARP);
     s->arp_stage=err?SCAN_ERROR:SCAN_DONE;
+    if(err) { s->monitor_error=true; return; }
+    monitor_scan_complete(s);
 }
 static void arp_start(AppState* s) {
     if(s->arp_stage==SCAN_ACTIVE || s->arp_stage==SCAN_DRAIN) return;
     s->arp_count=0; s->arp_view=0; s->arp_sent=0; s->arp_probe=1;
+    s->monitor_error=false;
     s->wol_target_index=0; s->wol_attempted=false;
     s->tcp_target_index=0;
     s->tcp_stage=SCAN_IDLE;
@@ -841,7 +916,7 @@ static void arp_start(AppState* s) {
     memset(s->tcp_results,0,sizeof(s->tcp_results));
     if(s->dhcp!=D_LEASE || !s->found || !(s->phy&1) ||
        zero_ip(s->ip) || zero_ip(s->mask)) {
-        s->arp_stage=SCAN_ERROR; return;
+        s->arp_stage=SCAN_ERROR; s->monitor_error=true; return;
     }
     sock_close(S_DHCP);
     sock_close(S_PING);
@@ -990,7 +1065,7 @@ static bool save_report(AppState* s) {
     if(ok) ok=storage_file_open(f,REPORT_FILE,FSAM_WRITE,FSOM_OPEN_APPEND);
     char row[144];
     if(ok) {
-        ok=file_text(f,"\n=== Flipper Ethernet Toolkit v0.5 ===\n");
+        ok=file_text(f,"\n=== Flipper Ethernet Toolkit v0.6 ===\n");
         snprintf(row,sizeof(row),"MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
                  s->mac[0],s->mac[1],s->mac[2],s->mac[3],s->mac[4],s->mac[5]);
         ok=ok&&file_text(f,row);
@@ -1103,6 +1178,59 @@ static bool save_csv(AppState* s) {
     return ok;
 }
 
+/* Append changes to microSD. Scan number is per app session (no RTC assumed).
+ * Absence after an ARP probe is NOT proof of a disconnected device. */
+static bool save_changes_csv(AppState* s) {
+    if(s->arp_stage==SCAN_ACTIVE || s->arp_stage==SCAN_DRAIN ||
+       !s->monitor_scan_number || network_busy(s)) return false;
+    Storage* storage=furi_record_open(RECORD_STORAGE);
+    if(!storage) {s->monitor_save_attempted=true;s->monitor_save_ok=false;return false;}
+    bool ok=storage_simply_mkdir(storage,"/ext/apps_data") &&
+            storage_simply_mkdir(storage,REPORT_DIR);
+    File* f=storage_file_alloc(storage);
+    if(!f) {furi_record_close(RECORD_STORAGE);s->monitor_save_attempted=true;
+            s->monitor_save_ok=false;return false;}
+    if(ok) ok=storage_file_open(f,CHANGES_FILE,FSAM_WRITE,FSOM_OPEN_APPEND);
+    char row[168];
+    if(ok) {
+        if(storage_file_size(f)==0)
+            ok=file_text(f,"scan,event,ip,mac_before,mac_after\n");
+        if(s->monitor_partial) {
+            snprintf(row,sizeof(row),"%lu,INCOMPLETE,,,\n",(unsigned long)s->monitor_scan_number);
+            ok=ok&&file_text(f,row);
+        } else if(!s->monitor_compared) {
+            snprintf(row,sizeof(row),"%lu,BASELINE,,,\n",(unsigned long)s->monitor_scan_number);
+            ok=ok&&file_text(f,row);
+        } else if(!s->monitor_new && !s->monitor_gone && !s->monitor_mac) {
+            snprintf(row,sizeof(row),"%lu,UNCHANGED,,,\n",(unsigned long)s->monitor_scan_number);
+            ok=ok&&file_text(f,row);
+        } else {
+            for(uint8_t i=0;i<s->monitor_event_count && ok;i++) {
+                const NetworkChange* e=&s->monitor_events[i];
+                const char* kind=e->kind==CHANGE_NEW?"NEW":
+                    (e->kind==CHANGE_GONE?"NOT_SEEN":"MAC_CHANGED");
+                char b[20]="",a[20]="";
+                if(e->kind!=CHANGE_NEW) snprintf(b,sizeof(b),"%02X:%02X:%02X:%02X:%02X:%02X",
+                    e->before[0],e->before[1],e->before[2],e->before[3],e->before[4],e->before[5]);
+                if(e->kind!=CHANGE_GONE) snprintf(a,sizeof(a),"%02X:%02X:%02X:%02X:%02X:%02X",
+                    e->after[0],e->after[1],e->after[2],e->after[3],e->after[4],e->after[5]);
+                snprintf(row,sizeof(row),"%lu,%s,%u.%u.%u.%u,%s,%s\n",
+                    (unsigned long)s->monitor_scan_number,kind,
+                    e->ip[0],e->ip[1],e->ip[2],e->ip[3],b,a);
+                ok=file_text(f,row);
+            }
+        }
+        if(ok) ok=storage_file_sync(f);
+    }
+    (void)storage_file_close(f);
+    storage_file_free(f);
+    furi_record_close(RECORD_STORAGE);
+    s->monitor_save_attempted=true;
+    s->monitor_save_ok=ok;
+    if(ok) s->monitor_saved_number=s->monitor_scan_number;
+    return ok;
+}
+
 static void ip_string(char* b,size_t cap,const uint8_t ip[4]) {
     snprintf(b,cap,"%u.%u.%u.%u",ip[0],ip[1],ip[2],ip[3]);
 }
@@ -1115,7 +1243,7 @@ static void app_draw(Canvas* canvas, void* ctx) {
     char line[64], ip[20];
     canvas_clear(canvas);
     canvas_set_font(canvas,FontPrimary);
-    canvas_draw_str(canvas,2,11,"Eth Toolkit v0.5");
+    canvas_draw_str(canvas,2,11,"Eth Toolkit v0.6");
     canvas_draw_line(canvas,0,14,127,14);
     canvas_set_font(canvas,FontSecondary);
     if(s.page==0) {
@@ -1265,16 +1393,56 @@ static void app_draw(Canvas* canvas, void* ctx) {
             canvas_draw_str(canvas,2,54,line);
         }
     } else {
-        canvas_draw_str(canvas,2,23,"Network inventory");
-        snprintf(line,sizeof(line),"ARP hosts %u",s.arp_count);
-        canvas_draw_str(canvas,2,33,line);
-        if(s.arp_count) {
-            const ArpHost* host=&s.hosts[s.arp_view];
-            ip_string(ip,sizeof(ip),host->ip);
-            canvas_draw_str(canvas,2,43,ip);
-            snprintf(line,sizeof(line),"Vendor: %s",mac_vendor(host->mac));
-            canvas_draw_str(canvas,2,53,line);
-        } else canvas_draw_str(canvas,2,43,"Run ARP scan (page 5)");
+        if(s.page==12) {
+            snprintf(line,sizeof(line),"Inventory %u/%u",s.arp_count?
+                     (unsigned)(s.arp_view+1):0,(unsigned)s.arp_count);
+            canvas_draw_str(canvas,2,23,line);
+            if(s.arp_count) {
+                const ArpHost* host=&s.hosts[s.arp_view];
+                ip_string(ip,sizeof(ip),host->ip);
+                canvas_draw_str(canvas,2,33,ip);
+                snprintf(line,sizeof(line),"%02X:%02X:%02X:%02X:%02X:%02X",
+                         host->mac[0],host->mac[1],host->mac[2],
+                         host->mac[3],host->mac[4],host->mac[5]);
+                canvas_draw_str(canvas,2,43,line);
+                snprintf(line,sizeof(line),"Vendor: %s",mac_vendor(host->mac));
+                canvas_draw_str(canvas,2,53,line);
+            } else canvas_draw_str(canvas,2,43,"Run ARP scan (page 5)");
+        } else {
+            snprintf(line,sizeof(line),"Monitor scan #%lu",(unsigned long)s.monitor_scan_number);
+            canvas_draw_str(canvas,2,23,line);
+            if(s.arp_stage==SCAN_ACTIVE || s.arp_stage==SCAN_DRAIN) {
+                snprintf(line,sizeof(line),"Scanning: %u sent",(unsigned)s.arp_sent);
+                canvas_draw_str(canvas,2,33,line);
+                canvas_draw_str(canvas,2,46,"Wait for scan...");
+            } else if(s.monitor_error) {
+                canvas_draw_str(canvas,2,33,"Scan failed");
+                canvas_draw_str(canvas,2,46,"Baseline preserved");
+            } else if(!s.monitor_scan_number) {
+                canvas_draw_str(canvas,2,33,"OK start ARP scan");
+                canvas_draw_str(canvas,2,46,"First = baseline");
+            } else if(s.monitor_partial) {
+                canvas_draw_str(canvas,2,33,"Too many ARP hosts");
+                canvas_draw_str(canvas,2,46,"Compare unavailable");
+            } else if(!s.monitor_compared) {
+                canvas_draw_str(canvas,2,33,"Baseline saved");
+                canvas_draw_str(canvas,2,46,"OK scan to compare");
+            } else {
+                snprintf(line,sizeof(line),"New:%u Lost:%u MAC:%u",
+                         s.monitor_new,s.monitor_gone,s.monitor_mac);
+                canvas_draw_str(canvas,2,33,line);
+                if(s.monitor_event_count) {
+                    const NetworkChange* e=&s.monitor_events[s.monitor_event_view];
+                    snprintf(line,sizeof(line),"%s %u.%u.%u.%u",
+                         e->kind==CHANGE_NEW?"NEW":e->kind==CHANGE_GONE?"NO":"MAC",
+                         e->ip[0],e->ip[1],e->ip[2],e->ip[3]);
+                    canvas_draw_str(canvas,2,44,line);
+                } else canvas_draw_str(canvas,2,44,"No changes observed");
+            }
+            canvas_draw_str(canvas,2,54,s.monitor_save_attempted?
+                (s.monitor_save_ok?"Log saved": "SD write failed"):
+                "Hold OK: save log");
+        }
     }
     snprintf(line,sizeof(line),"< > page %u/%u  OK",(unsigned)(s.page+1),PAGES);
     canvas_draw_str(canvas,2,63,line);
@@ -1339,6 +1507,12 @@ int32_t flipper_eth_toolkit_app(void* p) {
                 (event.key==InputKeyRight?1:4))%5);
         }
         if(got==FuriStatusOk && event.type==InputTypeLong &&
+           event.key==InputKeyOk && app.s.page==13 &&
+           !network_busy(&app.s) && app.s.monitor_scan_number &&
+           app.s.monitor_saved_number!=app.s.monitor_scan_number) {
+            (void)save_changes_csv(&app.s);
+        }
+        if(got==FuriStatusOk && event.type==InputTypeLong &&
            event.key==InputKeyOk && app.s.page==9 &&
            app.s.tcp_stage!=SCAN_ACTIVE) {
             app.s.tcp_target_index=(uint8_t)((app.s.tcp_target_index+1)%(app.s.arp_count+1));
@@ -1383,6 +1557,10 @@ int32_t flipper_eth_toolkit_app(void* p) {
                 } else if(app.s.page==12) {
                     int v=(int)app.s.arp_view+delta;
                     if(v>=0 && v<(int)app.s.arp_count) app.s.arp_view=(uint8_t)v;
+                } else if(app.s.page==13) {
+                    int v=(int)app.s.monitor_event_view+delta;
+                    if(v>=0 && v<(int)app.s.monitor_event_count)
+                        app.s.monitor_event_view=(uint8_t)v;
                 } else if(app.s.page==9 && app.s.tcp_stage!=SCAN_ACTIVE) {
                     static const uint16_t step[5]={1,10,100,1000,10000};
                     int next=(int)app.s.custom_port+delta*(int)step[app.s.custom_digit];
@@ -1410,6 +1588,8 @@ int32_t flipper_eth_toolkit_app(void* p) {
                     (void)save_csv(&app.s);
                 else if(app.s.page==11 && !network_busy(&app.s))
                     discovery_start(&app.s);
+                else if(app.s.page==13 && !network_busy(&app.s))
+                    arp_start(&app.s);
                 else if(app.s.page<2) update_physical(&app.s);
             }
         }
